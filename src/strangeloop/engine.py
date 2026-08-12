@@ -108,7 +108,11 @@ class StrangeloopAgent:
         # is not consulted for approval, policy, capability, reward, quota,
         # sleep, or lifecycle decisions.
         self.memory_graph = memory_graph or MemoryGraph(self.event_store)
-        self.memory_graph.ensure_current(self.session_id)
+        # This cache is intentionally updated only by the agent's caller
+        # thread.  The monitor serves it read-only from its HTTP thread, so it
+        # never touches the thread-affine SQLite connection.
+        self._memory_graph_public_status = self.memory_graph.ensure_current(
+            self.session_id).to_dict()
         self.self_model = self_model or EventSourcedSelfModel(self.event_store)
         if (not isinstance(loop_remote_call_budget, int)
                 or isinstance(loop_remote_call_budget, bool)
@@ -1331,6 +1335,20 @@ class StrangeloopAgent:
         return now + timedelta(seconds=5)
 
     def expedition_slice(self, usage_adapter: Any) -> Dict[str, Any]:
+        """Run one bounded slice, then refresh the derived graph projection.
+
+        The ``finally`` covers every quota, stop, experiment, and web-return
+        branch without making graph maintenance part of any control decision.
+        """
+        try:
+            return self._expedition_slice_impl(usage_adapter)
+        finally:
+            try:
+                self._refresh_memory_graph()
+            except Exception:
+                pass
+
+    def _expedition_slice_impl(self, usage_adapter: Any) -> Dict[str, Any]:
         if self._expedition is None or self._expedition_refresh_gate is None:
             raise RuntimeError("expedition is not configured")
         if (self._expedition.state.value == "waiting_quota_retry"
@@ -1942,7 +1960,7 @@ class StrangeloopAgent:
             seed_ids = (stored.seed_id,)
             notices.append("Seed proposal is a candidate and requires external approval.")
         self._signal_external_salience(observation.event_id, "text")
-        self.memory_graph.ensure_current(self.session_id)
+        self._refresh_memory_graph()
         return TurnResult(
             session_id=self.session_id, response_text=response, decision=decision,
             # TurnResult continues to identify the four operational turn
@@ -2469,7 +2487,7 @@ class StrangeloopAgent:
     def export_session(self) -> Dict[str, Any]:
         """Export inspectable, current logical-session records."""
         events = self.event_store.list(self.session_id)
-        graph = self.memory_graph.ensure_current(self.session_id)
+        graph = self._refresh_memory_graph()
         return {
             "session_id": self.session_id,
             "events": [event.to_dict() for event in events],
@@ -2483,11 +2501,48 @@ class StrangeloopAgent:
 
     def memory_graph_status(self) -> Dict[str, Any]:
         """Return a refreshed, metadata-only graph projection status."""
-        return self.memory_graph.ensure_current(self.session_id).to_dict()
+        return self._refresh_memory_graph().to_dict()
+
+    def memory_graph_public_status(self) -> Dict[str, Any]:
+        """Return the caller-thread refreshed graph summary without SQLite I/O.
+
+        ``CognitiveMonitor`` calls this from an HTTP request thread.  Returning
+        a copy prevents that monitoring path from becoming an authority or a
+        writer for this rebuildable projection.
+        """
+        return dict(self._memory_graph_public_status)
+
+    def _refresh_memory_graph(self):
+        """Refresh the non-authoritative graph without affecting agent control.
+
+        A graph failure is observable as a bounded status, but can never block
+        quota, grants, seed policy, reward, sleep, or the current expedition.
+        """
+        try:
+            graph = self.memory_graph.ensure_current(self.session_id)
+            self._memory_graph_public_status = graph.to_dict()
+            return graph
+        except Exception:
+            # Do not disclose database paths or exception text in public
+            # monitoring data.  The ledger remains authoritative and intact.
+            cached = dict(getattr(self, "_memory_graph_public_status", {}))
+            cached["status"] = "unavailable"
+            self._memory_graph_public_status = cached
+            raise
+
+    def _expedition_status_after_graph_refresh(self) -> Dict[str, Any]:
+        """Publish graph progress at a completed expedition slice boundary."""
+        try:
+            self._refresh_memory_graph()
+        except Exception:
+            # Graph projection is deliberately fail-open relative to the
+            # bounded research state machine; its cached status remains public.
+            pass
+        return self.expedition_status()
 
     def explain_memory_event(self, event_id: str) -> Dict[str, Any]:
         """Explain one event's bounded provenance neighborhood without payloads."""
-        graph = self.memory_graph.ensure_current(self.session_id)
+        graph = self._refresh_memory_graph()
         return {"graph": graph.to_dict(), "event_id": event_id,
                 "neighbors": self.memory_graph.neighbors(self.session_id, event_id)}
 

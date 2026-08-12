@@ -167,6 +167,22 @@ class MonitorTests(unittest.TestCase):
         finally:
             monitor.stop()
 
+    def test_memory_graph_projection_is_aggregate_only_and_reports_lag(self):
+        state = _state_projection({"memory_graph": {
+            "graph_version": "memory_graph_v1", "node_count": 12,
+            "edge_count": 18, "ledger_head_sequence": 3,
+            "rebuilt_from_event_count": 3, "ledger_head_event_id": "evt_private",
+            "session_id": "session_private", "authority": "derived_from_event_ledger",
+        }}, [project_event(event(5, "decision", {"turn_id": "turn_5"}))])
+        graph = state["memory_graph"]
+        self.assertEqual("available", graph["status"])
+        self.assertEqual((12, 18, 3, 2),
+                         (graph["node_count"], graph["edge_count"],
+                          graph["ledger_head_sequence"], graph["ledger_lag_events"]))
+        rendered = json.dumps(graph)
+        self.assertNotIn("evt_private", rendered)
+        self.assertNotIn("session_private", rendered)
+
     def test_agent_monitor_projects_public_provider_quota_not_raw_usage(self):
         now = datetime.now(timezone.utc)
         controller = QuotaController()

@@ -502,6 +502,11 @@ class EngineTests(unittest.TestCase):
                          {event.payload["capability"] for event in grants})
         self.assertEqual("forager", status["persona"])
         self.assertEqual("ready", status["state"])
+        # The graph is a projection only, but each completed slice refreshes
+        # it on the agent thread so the monitor can safely read its cache.
+        graph = agent.memory_graph_public_status()
+        self.assertEqual(store.list("expedition-auth")[-1].sequence,
+                         graph["ledger_head_sequence"])
 
     def test_expedition_rejects_an_unrelated_or_mismatched_user_observation(self):
         runtime = k3_runtime(FakeK3Transport())

@@ -724,6 +724,10 @@ class CognitiveMonitor:
         # thread-safe public accessor; never call agent.state() here because
         # common stores are thread-affine.
         self._quota_source = getattr(agent, "quota_status", None) if agent else None
+        # The graph accessor returns an immutable-in-practice cached summary.
+        # It must not rebuild or open the agent's SQLite connection here.
+        self._memory_graph_source = (getattr(agent, "memory_graph_public_status", None)
+                                     if agent else None)
         self._event_source = event_source
         self._store = event_store or (getattr(agent, "event_store", None) if agent else None)
         self._session_id = session_id or getattr(agent, "session_id", None) or getattr(self._store, "session_id", None)
@@ -787,6 +791,11 @@ class CognitiveMonitor:
                     raw["quota"] = {"configured": False, "authority": "unknown",
                                     "freshness": "unknown", "allow_call": False,
                                     "reason": "not_configured"}
+            if callable(self._memory_graph_source):
+                try:
+                    raw["memory_graph"] = self._memory_graph_source()
+                except Exception:
+                    raw["memory_graph"] = {"status": "unavailable"}
             try:
                 events = [project_event(event) for event in self._events()]
             except Exception:
@@ -909,9 +918,36 @@ def _state_projection(raw: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict
             "learning_and_stops": latest(frozenset(("value_estimate", "rpe_update", "autonomy_stopped", "correction"))),
             "sleep_wake": _sleep_projection(raw, events),
             "quota": _quota_projection(raw),
+            "memory_graph": _memory_graph_projection(raw, events),
             "unattended": _unattended_projection(raw, events),
             "expedition": _expedition_projection(raw, events),
             "event_count": len(events), "notice": "Hidden chain-of-thought is neither stored nor shown."}
+
+
+def _memory_graph_projection(raw: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Expose only aggregate graph freshness, never graph identifiers/content."""
+    source = raw.get("memory_graph")
+    if not isinstance(source, dict):
+        return {"status": "unavailable"}
+    if source.get("graph_version") != "memory_graph_v1":
+        return {"status": "unavailable"}
+    fields = ("node_count", "edge_count", "ledger_head_sequence", "rebuilt_from_event_count")
+    safe = {}
+    for field in fields:
+        value = source.get(field)
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value < 0 or value > 1000000000):
+            return {"status": "unavailable"}
+        safe[field] = value
+    latest_sequence = max((event.get("sequence", 0) for event in events
+                           if isinstance(event.get("sequence"), int)), default=0)
+    safe.update({
+        "status": "available",
+        "graph_version": "memory_graph_v1",
+        "authority": "derived_from_event_ledger",
+        "ledger_lag_events": max(0, latest_sequence - safe["ledger_head_sequence"]),
+    })
+    return safe
 
 
 class _Handler(BaseHTTPRequestHandler):
