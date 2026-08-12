@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strangeloop-agent"
+version = "0.1.0"
+description = "An auditable persistent agent architecture inspired by Yogacara cognitive theory"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Strangeloop contributors" }]
+dependencies = []
+
+[project.scripts]
+strangeloop = "strangeloop.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
