@@ -7,7 +7,7 @@ from unittest.mock import patch
 from urllib.error import URLError
 
 from strangeloop.autoloop import TickContext, TickTrigger
-from strangeloop.contracts import WorkspaceFrame
+from strangeloop.contracts import SeedGuidance, WorkspaceFrame
 from strangeloop.media import inspect_media
 from strangeloop.providers.kimi_code import (
     CallableSecretResolver, KIMI_CODE_BASE_URL, KimiCodeProviderError,
@@ -83,6 +83,59 @@ class KimiCodeProviderTests(unittest.TestCase):
         self.assertEqual("json_schema", payload["response_format"]["type"])
         self.assertNotIn("tools", payload)
         self.assertEqual(1, runtime.calls_used)
+
+    def test_deliberation_without_guidance_keeps_legacy_public_workspace_format(self):
+        transport = FakeTransport([{
+            "response_text": "A bounded public response.", "hypotheses": [],
+            "uncertainties": [], "alternatives": [],
+            "action": {"action_type": "response", "rationale_summary": "Respond safely.",
+                       "is_mutating": False},
+        }])
+        runtime = _runtime(transport)
+        workspace = WorkspaceFrame("turn", ("evt_1",), (), (), (), ())
+        runtime.complete_deliberation("hello", workspace)
+        messages = transport.calls[0][2]["messages"]
+        self.assertEqual(
+            "Return only the requested JSON. Create an inspectable public decision record. "
+            "Do not claim subjective experience, sentience, a soul, enlightenment, or an intrinsic self. "
+            "Propose only a non-mutating response; do not request tools or memory approval.",
+            messages[0]["content"])
+        self.assertEqual(
+            "Public workspace: {\"turn_id\":\"turn\",\"observation_event_ids\":[\"evt_1\"],"
+            "\"percept_event_ids\":[],\"loop_tick_event_ids\":[]}\nUser prompt: hello",
+            messages[1]["content"])
+
+    def test_deliberation_receives_only_fixed_redacted_seed_guidance(self):
+        transport = FakeTransport([{
+            "response_text": "Please verify this with a source.", "hypotheses": [],
+            "uncertainties": ["A source check is still needed."], "alternatives": [],
+            "action": {"action_type": "response", "rationale_summary": "Respond safely.",
+                       "is_mutating": False},
+        }])
+        runtime = _runtime(transport)
+        digest = "a" * 64
+        workspace = WorkspaceFrame(
+            "turn", ("evt_1",), ("seed_not_for_model_content",), (), (), (),
+            seed_guidance=(SeedGuidance(
+                seed_id="seed_1", current_authority_event_id="evt_authority_1",
+                snapshot_digest=digest, priority_band="primary"),))
+        runtime.complete_deliberation("hello", workspace)
+        messages = transport.calls[0][2]["messages"]
+        public_context = json.loads(messages[1]["content"].split("\nUser prompt: ", 1)[0]
+                                    .split("Public workspace: ", 1)[1])
+        self.assertEqual([{
+            "seed_id": "seed_1", "current_authority_event_id": "evt_authority_1",
+            "snapshot_digest": digest, "directive": "request_human_review",
+            "priority_band": "primary",
+        }], public_context["seed_guidance"])
+        self.assertIn("response-style preference", messages[0]["content"])
+        self.assertIn("not fact or evidence", messages[0]["content"])
+        self.assertIn("not a tool instruction", messages[0]["content"])
+        self.assertIn("quotas, sleep, stopping, or persistent memory", messages[0]["content"])
+        rendered = messages[1]["content"]
+        for forbidden in ("cue_terms", "user original", "provenance", "strength",
+                          "confidence", "nonce", "permission"):
+            self.assertNotIn(forbidden, rendered)
 
     def test_image_perceptor_encodes_image_and_never_supports_audio(self):
         transport = FakeTransport([{

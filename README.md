@@ -8,6 +8,8 @@
 
 项目借用的不是“八个软件模块”的比喻，而是几个工程问题：如何把观察和推断分开、如何使习惯性倾向可追溯、如何避免把暂时叙事当作固定自我，以及如何为未来的反证纠错保留可追溯条件。原义、工程类比和边界见：[RFC-0001](docs/RFC-0001-yogacara-agent.md)、[词汇表](docs/GLOSSARY.md)。
 
+默认流程保留逐条 `USER` 批准。用户也可一次性显式启用 **seed auto-update**：内部以 digest 与 nonce 绑定、可撤销且有限期的 standing authorization 让宿主在**下一 turn**自动处理合规低影响候选的 activate/reinforce/tighten/retire，不需要逐种子再次批准。模型只能提出；工具/网页、奖励、TD、实验、配额和 sleep/wake 都不能授予或驱动该更新。它不训练模型、不改变能力、配额、停止或自我模型。完整事件协议、tombstone、CAS、purge 和监控脱敏边界见：[RFC-0005](docs/RFC-0005-standing-seed-policy.md)。
+
 ## 当前架构（RFC-0001 MVP + RFC-0002 实验切片）
 
 ```mermaid

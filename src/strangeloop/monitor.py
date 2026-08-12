@@ -12,6 +12,7 @@ import json
 import re
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, urlparse
@@ -62,6 +63,11 @@ _SLEEP_ARCHIVE_FIELDS = frozenset((
     "archive_version", "schema_version", "chain_head_sequence",
     "quota_remaining", "quota_total", "quota_window_kind",
 ))
+_SEED_POLICY_KINDS = frozenset((
+    "seed_standing_policy", "seed_standing_policy_revoked",
+    "seed_auto_eligibility", "seed_auto_applied",
+))
+_SEED_AUTO_OPERATIONS = frozenset(("activate", "reinforce", "tighten", "retire"))
 _PUBLIC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _ISO8601 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
@@ -212,6 +218,34 @@ def _safe_sleep_archive_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _safe_seed_policy_payload(payload: Dict[str, Any], event_kind: str) -> Dict[str, Any]:
+    """Keep only metadata needed for an aggregate, redacted policy count.
+
+    The timeline never exposes seed cues, provenance, policy limits, nonce,
+    policy digest, or policy identifier.  ``policy_event_id`` is retained
+    internally in the existing public event relation so the state projection
+    can count revocations/applications, but it is not returned by the
+    aggregate projection.
+    """
+    result: Dict[str, Any] = {}
+    if event_kind == "seed_standing_policy":
+        value = payload.get("expires_at")
+        if isinstance(value, str) and _ISO8601.match(value):
+            result["expires_at"] = value
+    elif event_kind == "seed_standing_policy_revoked":
+        value = payload.get("policy_event_id")
+        if isinstance(value, str) and _PUBLIC_ID.match(value):
+            result["policy_event_id"] = value
+    elif event_kind == "seed_auto_applied":
+        policy_event_id = payload.get("policy_event_id")
+        operation = payload.get("operation")
+        if isinstance(policy_event_id, str) and _PUBLIC_ID.match(policy_event_id):
+            result["policy_event_id"] = policy_event_id
+        if operation in _SEED_AUTO_OPERATIONS:
+            result["operation"] = operation
+    return result
+
+
 def _safe_payload(payload: Any, event_kind: str = "") -> Dict[str, Any]:
     """Return a strict public projection; unknown/nested data is omitted."""
     if not isinstance(payload, dict):
@@ -220,6 +254,8 @@ def _safe_payload(payload: Any, event_kind: str = "") -> Dict[str, Any]:
         return _safe_mirror_payload(payload)
     if event_kind == "sleep_archive":
         return _safe_sleep_archive_payload(payload)
+    if event_kind in _SEED_POLICY_KINDS:
+        return _safe_seed_policy_payload(payload, event_kind)
     result: Dict[str, Any] = {}
     for key, value in payload.items():
         name = str(key).lower()
@@ -806,6 +842,56 @@ class _SQLitePublicEvent:
         self.parent_event_ids = tuple(json.loads(row[6])); self.created_at = row[7]
 
 
+def _standing_seed_policy_projection(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return counts only for standing seed policy lifecycle records.
+
+    The result intentionally has no policy ID, expiry timestamp, nonce,
+    digest, cue, provenance, seed ID, or limit.  It is an operational audit
+    summary, not a memory retrieval surface or a new authorization path.
+    """
+    policies = {}
+    revoked = set()
+    applications = []
+    for record in events:
+        kind, payload = record.get("kind"), record.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        if kind == "seed_standing_policy":
+            policies[record.get("event_id")] = payload.get("expires_at")
+        elif kind == "seed_standing_policy_revoked":
+            policy_event_id = payload.get("policy_event_id")
+            if isinstance(policy_event_id, str):
+                revoked.add(policy_event_id)
+        elif kind == "seed_auto_applied":
+            applications.append(payload)
+    now = datetime.now(timezone.utc)
+    active = expired = revoked_count = 0
+    for event_id, expires_at in policies.items():
+        if event_id in revoked:
+            revoked_count += 1
+            continue
+        try:
+            is_expired = (not isinstance(expires_at, str)
+                          or datetime.fromisoformat(expires_at.replace("Z", "+00:00")) <= now)
+        except ValueError:
+            is_expired = True
+        if is_expired:
+            expired += 1
+        else:
+            active += 1
+    activation_count = sum(1 for payload in applications if payload.get("operation") == "activate")
+    update_count = sum(1 for payload in applications if payload.get("operation") in _SEED_AUTO_OPERATIONS
+                       and payload.get("operation") != "activate")
+    return {
+        "active_count": active,
+        "revoked_count": revoked_count,
+        "expired_count": expired,
+        "auto_activation_count": activation_count,
+        "auto_update_count": update_count,
+        "notice": "Aggregate policy telemetry only; not memory content, authority, reward, or lifecycle control.",
+    }
+
+
 def _state_projection(raw: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict[str, Any]:
     latest = lambda kinds: [event for event in events if event["kind"] in kinds][-20:]
     current_goal = _safe_text(raw.get("current_goal") or raw.get("goal") or "")
@@ -819,6 +905,7 @@ def _state_projection(raw: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict
             "dmn_loop": safe_loop, "model_invocations": latest(frozenset(("model_invocation",))),
             "tool_stages": latest(_STAGE_KINDS), "seeds_and_claims": latest(frozenset(("seed_proposed", "seed_approved", "seed_retired", "self_claim_proposed", "self_claim_approved", "self_claim_revoked"))),
             "metacognitive_mirrors": latest(frozenset((_MIRROR_KIND,))),
+            "standing_seed_policy": _standing_seed_policy_projection(events),
             "learning_and_stops": latest(frozenset(("value_estimate", "rpe_update", "autonomy_stopped", "correction"))),
             "sleep_wake": _sleep_projection(raw, events),
             "quota": _quota_projection(raw),

@@ -18,14 +18,16 @@ from .autoloop import (CycleResult, FunctionalLoopController, LoopConfig,
 
 from .contracts import (
     ActionProposal, CognitiveEvent, DecisionRecord, Deliberation, EventKind,
-    FRONTIER_STRATEGY_ARM_VERSION, SeedDisposition, SourceKind, TurnResult, WorkspaceFrame,
+    FRONTIER_STRATEGY_ARM_VERSION, SeedDisposition, SeedGuidance, SeedStatus,
+    SourceKind, TurnResult, WorkspaceFrame,
 )
 from .deliberation import Deliberator, TransparentHeuristicDeliberator
 from .media import (BasicMetadataPerceptor, MediaArtifact, MediaPerceptor,
                     Percept, ingest_media, validate_percepts)
 from .metacognition import (EvidencePolarity, MirrorAuditor, PublicEvidence)
 from .policy import PolicyGate
-from .seeds import SQLiteSeedStore
+from .seeds import (SQLiteSeedStore, SeedStandingPolicy,
+                    canonical_seed_identity)
 from .self_model import EventSourcedSelfModel
 from .store import SQLiteEventStore
 from .store import frontier_experiment_reward_vector
@@ -43,7 +45,8 @@ from .sleep import SleepState, SleepWakeCoordinator, build_public_archive
 from .quota import QuotaSource, ForegroundRefreshGate, ForegroundRefreshPolicy
 from .kimi_cli import KimiCliUsageResult
 from .capabilities import ResearchAutonomyProfile
-from .expedition import ExpeditionConfig, ExpeditionOutcome, ExpeditionScheduler
+from .expedition import (ExpeditionConfig, ExpeditionOutcome, ExpeditionScheduler,
+                         SeedGuidanceSnapshot)
 from .frontier_learning import (EvidenceKind, EvidenceSource, FrontierEvidence,
                                 FrontierLearner, FrontierLearningSpec)
 from .experiment_harness import (ExperimentAuthority, ExperimentBudget, ExperimentHarness,
@@ -137,6 +140,7 @@ class StrangeloopAgent:
         self._wake_continuation_last: Dict[str, Any] = {"armed": False, "reason": "not_armed"}
         self._instance_marker = "instance_%s" % uuid4().hex
         self._expedition: Optional[ExpeditionScheduler] = None
+        self._expedition_goal: Optional[str] = None
         self._expedition_goal_digest: Optional[str] = None
         self._expedition_refresh_gate: Optional[ForegroundRefreshGate] = None
         self._expedition_approval_event_id: Optional[str] = None
@@ -164,6 +168,11 @@ class StrangeloopAgent:
         self._expedition_duplicate_experiment_result_count = 0
         self._expedition_last_strategy_arm_id: Optional[str] = None
         self._expedition_last_strategy_arm_version: Optional[str] = None
+        # The durable context event is an audit edge only.  The current
+        # guidance snapshot is recomputed before each slice, so a bounded
+        # user-originated seed update can affect a later slice but never an
+        # already selected task.
+        self._expedition_seed_context_event_id: Optional[str] = None
         if tool_session is not None and tool_session.session_id != self.session_id:
             raise ValueError("tool_session must belong to the agent session")
         self._heuristic_deliberator = TransparentHeuristicDeliberator()
@@ -825,6 +834,19 @@ class StrangeloopAgent:
         self._expedition_duplicate_experiment_result_count = 0
         self._expedition_last_strategy_arm_id = None
         self._expedition_last_strategy_arm_version = None
+        guidance = self._expedition_seed_guidance()
+        self._expedition_seed_context_event_id = self._record_expedition_seed_context(
+            run_id, consumption.event_id, guidance).event_id
+        if guidance:
+            self._expedition.set_seed_guidance(SeedGuidanceSnapshot(
+                seed_ids=tuple(item.seed_id for item in guidance),
+                authority_event_ids=tuple(item.current_authority_event_id for item in guidance),
+                digest=sha256(json.dumps([
+                    {"seed_id": item.seed_id,
+                     "authority_event_id": item.current_authority_event_id,
+                     "snapshot_digest": item.snapshot_digest,
+                     "priority_band": item.priority_band}
+                    for item in guidance], sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()))
         return self.expedition_status()
 
     @staticmethod
@@ -967,10 +989,18 @@ class StrangeloopAgent:
             self._expedition_frontier_state_id, strategy_arm_id))
         try:
             with self.event_store.transaction():
+                ranking_parents = (self._expedition_consumption_event_id,)
+                # The optional context is recomputed immediately before this
+                # choice.  Binding it makes a later replay able to distinguish
+                # an unguided ranking from one whose already-eligible tasks
+                # were softly reordered by current, non-authoritative seed
+                # guidance.  It never widens the authorization parent.
+                if self._expedition_seed_context_event_id is not None:
+                    ranking_parents += (self._expedition_seed_context_event_id,)
                 ranking = self.event_store.append(CognitiveEvent(
                     session_id=self.session_id, kind=EventKind.FRONTIER_RANKING_DECISION,
                     source_kind=SourceKind.SYSTEM, source_ref="FrontierLearningHost",
-                    parent_event_ids=(self._expedition_consumption_event_id,), payload={
+                    parent_event_ids=ranking_parents, payload={
                         "ranking_id": ranking_id, "transition_id": transition_id,
                         "frontier_task_id": decision.task.task_id, "candidate_digest": candidate_digest,
                         "strategy_arm_id": strategy_arm_id, "strategy_arm_version": strategy_arm_version,
@@ -1378,6 +1408,36 @@ class StrangeloopAgent:
         if self._expedition.state.value == "waiting_quota_retry":
             if not self._expedition.resume_after_fresh_quota(self._sleep_now()):
                 return self.expedition_status()
+        # Reproject only at the slice boundary.  This cannot affect any
+        # already active task and runs after all quota/sleep/stop gates above.
+        guidance = self._expedition_seed_guidance()
+        # Every selected slice gets its own durable context edge, including an
+        # empty projection.  A correction, revocation, or expiry between
+        # slices therefore becomes visible in the next ranking's lineage.
+        # Failure is terminal before a task, tool grant, or model call exists.
+        try:
+            assert self._expedition_consumption_event_id is not None
+            consumed = self.event_store.get(self._expedition_consumption_event_id)
+            if consumed is None:
+                raise RuntimeError("expedition consumption record is unavailable")
+            self._expedition_seed_context_event_id = self._record_expedition_seed_context(
+                str(consumed.payload["run_id"]), self._expedition_consumption_event_id, guidance).event_id
+        except BaseException:
+            self._frontier_fail_closed("seed_context_store_failure")
+            raise
+        if guidance:
+            snapshot = SeedGuidanceSnapshot(
+                seed_ids=tuple(item.seed_id for item in guidance),
+                authority_event_ids=tuple(item.current_authority_event_id for item in guidance),
+                digest=sha256(json.dumps([
+                    {"seed_id": item.seed_id,
+                     "authority_event_id": item.current_authority_event_id,
+                     "snapshot_digest": item.snapshot_digest,
+                     "priority_band": item.priority_band}
+                    for item in guidance], sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest())
+            self._expedition.set_seed_guidance(snapshot)
+        else:
+            self._expedition.set_seed_guidance(None)
         decision = self._expedition.begin_slice(self._sleep_now())
         if decision is None:
             return self.expedition_status()
@@ -1750,9 +1810,15 @@ class StrangeloopAgent:
             raise ValueError("feedback target must belong to the current session")
         forbidden = {EventKind.MODEL_INVOCATION, EventKind.AUTONOMY_CONTROL,
                      EventKind.AUTONOMY_STOPPED, EventKind.PURGE,
-                     EventKind.METACOGNITIVE_MIRROR}
+                     EventKind.METACOGNITIVE_MIRROR,
+                     EventKind.SEED_PROPOSED, EventKind.SEED_APPROVED,
+                     EventKind.SEED_RETIRED, EventKind.SEED_STANDING_POLICY,
+                     EventKind.SEED_STANDING_POLICY_REVOKED,
+                     EventKind.SEED_UPDATE_PROPOSED,
+                     EventKind.SEED_AUTO_ELIGIBILITY,
+                     EventKind.SEED_AUTO_APPLIED}
         if target.kind in forbidden:
-            raise ValueError("control, quota, and mirror records cannot be reward targets")
+            raise ValueError("control, seed, quota, and mirror records cannot be reward targets")
         feedback_event = self.event_store.append(CognitiveEvent(
             session_id=self.session_id, kind=EventKind.OBSERVATION,
             source_kind=SourceKind.USER, source_ref="user_drive_feedback",
@@ -1779,8 +1845,12 @@ class StrangeloopAgent:
             payload={"content": user_text, "channel": "text"},
         ))
         active_seeds = self.seed_store.retrieve(
-            self.session_id, user_text.split(), scope="conversation"
+            self.session_id, self._seed_cue_terms(user_text), scope="conversation"
         )
+        # Build guidance from the pre-turn projection.  Any automatic seed
+        # maintenance happens only after the result below, therefore it can
+        # influence the next turn but cannot rewrite this model request.
+        seed_guidance = self._seed_guidance_for(active_seeds)
         claims = self.self_model.current_claims(self.session_id)
         workspace = WorkspaceFrame(
             turn_id="turn_%s" % uuid4().hex,
@@ -1792,6 +1862,7 @@ class StrangeloopAgent:
             loop_tick_event_ids=self._event_ids(EventKind.LOOP_TICK),
             reward_event_ids=self._event_ids(EventKind.REWARD_OBSERVATION),
             value_estimate_event_ids=self._event_ids(EventKind.VALUE_ESTIMATE),
+            seed_guidance=seed_guidance,
         )
         deliberation, provider_notice = self._deliberate_with_fallback(
             user_text, workspace, observation.event_id
@@ -1842,7 +1913,21 @@ class StrangeloopAgent:
             evidence_events=(observation, result_event),
         )
         seed_ids = ()
-        if deliberation.proposed_seed is not None:
+        seed_auto = self.seed_auto_update_status()
+        if seed_auto["state"] == "active":
+            seed_ids, seed_action = self._auto_process_text_seed(
+                user_text, observation.event_id, decision_event.event_id)
+            if seed_action in ("activate", "reinforce"):
+                notices.append(
+                    "Seed auto-update was applied by the host under the active user standing policy; "
+                    "no per-seed approval was required."
+                )
+            else:
+                notices.append(
+                    "Seed auto-update was handled automatically under the active user standing policy; "
+                    "no per-seed approval was requested."
+                )
+        elif deliberation.proposed_seed is not None:
             candidate = self._server_seed_candidate(
                 user_text, observation.event_id, decision_event.event_id
             )
@@ -2163,6 +2248,132 @@ class StrangeloopAgent:
         ))
         return self.seed_store.approve(seed_id, approval.event_id)
 
+    def enable_seed_auto_update(self, user_event_id: str,
+                                policy: SeedStandingPolicy, policy_id: str,
+                                nonce: str, issued_at: str) -> Dict[str, Any]:
+        """Consume one explicit CLI/user standing authorization.
+
+        The caller must have already appended the exact USER approval event.
+        This method never manufactures user authority and gives no model,
+        reward, tool, quota, sleep, or stop-control privilege.
+        """
+        self.seed_store.issue_standing_policy(
+            self.session_id, user_event_id, policy, nonce=nonce,
+            policy_id=policy_id, issued_at=issued_at,
+            source_ref="cli_user_command")
+        return self.seed_auto_update_status()
+
+    def disable_seed_auto_update(self, user_event_id: str,
+                                 reason: str = "user_requested") -> Dict[str, Any]:
+        """Consume an exact USER revocation for the latest active policy."""
+        current = self.seed_store.standing_policy_status(self.session_id)
+        if current is None or current.get("status") != "active":
+            raise RuntimeError("seed auto-update has no active standing policy")
+        self.seed_store.revoke_standing_policy(
+            self.session_id, current["policy_id"], user_event_id,
+            reason=reason, source_ref="cli_user_command")
+        return self.seed_auto_update_status()
+
+    def seed_auto_update_status(self) -> Dict[str, Any]:
+        """Return aggregate standing-policy state without seed or authority data."""
+        current = self.seed_store.standing_policy_status(self.session_id)
+        active_count = sum(
+            seed.status.value == "active"
+            for seed in self.seed_store.list(self.session_id)
+        )
+        if current is None:
+            return {
+                "configured": False, "state": "not_configured",
+                "enabled": False, "active_seed_count": active_count,
+                "auto_activations": 0, "auto_updates": 0,
+                "per_seed_confirmation_required": True,
+                "authority": "explicit_user_standing_policy_only",
+            }
+        state = current["status"]
+        return {
+            "configured": True, "state": state, "enabled": state == "active",
+            "expires_at": current["expires_at"],
+            "active_seed_count": active_count,
+            "auto_activations": current["auto_activations_used"],
+            "auto_updates": current["auto_updates_used"],
+            "max_auto_activations": current["max_auto_activations"],
+            "max_auto_updates": current["max_auto_updates"],
+            "max_active_seeds": current["max_active_seeds"],
+            "per_seed_confirmation_required": state != "active",
+            "authority": "explicit_user_standing_policy_only",
+            "isolation": "no_reward_td_capability_quota_sleep_or_stop_authority",
+        }
+
+    def _seed_guidance_for(self, seeds: Sequence[SeedDisposition]) -> Tuple[SeedGuidance, ...]:
+        """Return at most two host-derived, content-free active seed cues.
+
+        This is a projection of current ledger state, never a model memory
+        proposal.  It deliberately does not expose cue terms, user text,
+        confidence, strength, provenance, or policy nonces to K3.
+        """
+        active = [seed for seed in seeds if seed.status == SeedStatus.ACTIVE]
+        if not active:
+            return ()
+        events = self.event_store.list(self.session_id)
+        result = []
+        for seed in active[:2]:
+            digest = sha256(json.dumps(self._seed_export(seed), ensure_ascii=False,
+                                       sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            authority_id = None
+            for event in reversed(events):
+                if event.kind == EventKind.SEED_AUTO_APPLIED:
+                    if (event.payload.get("seed_id") == seed.seed_id
+                            and event.payload.get("operation") != "retire"
+                            and event.payload.get("new_seed_digest") == digest):
+                        authority_id = event.event_id
+                        break
+                elif event.kind == EventKind.SEED_APPROVED:
+                    if event.payload.get("seed_id") == seed.seed_id:
+                        authority_id = event.event_id
+                        break
+            # A replayed active seed without a matching durable authority is
+            # not guidance.  Fail closed rather than guessing its lineage.
+            if authority_id is None:
+                continue
+            result.append(SeedGuidance(
+                seed_id=seed.seed_id, current_authority_event_id=authority_id,
+                snapshot_digest=digest,
+                priority_band="primary" if not result else "secondary"))
+        return tuple(result)
+
+    def _expedition_seed_guidance(self) -> Tuple[SeedGuidance, ...]:
+        """Project active guidance relevant to the explicit expedition goal."""
+        if self._expedition_goal is None:
+            return ()
+        matches = self.seed_store.retrieve(
+            self.session_id, self._seed_cue_terms(self._expedition_goal), scope="conversation")
+        return self._seed_guidance_for(matches)
+
+    def _record_expedition_seed_context(self, run_id: str,
+                                        consumption_event_id: str,
+                                        guidance: Sequence[SeedGuidance]) -> CognitiveEvent:
+        """Append the redacted, non-authoritative expedition guidance edge."""
+        authorities = [{"seed_id": item.seed_id,
+                        "authority_event_id": item.current_authority_event_id,
+                        "snapshot_digest": item.snapshot_digest,
+                        "priority_band": item.priority_band}
+                       for item in guidance]
+        # Use the same host clock that established the expedition authorization
+        # window.  Tests and embedders may inject that clock; mixing it with
+        # wall time would fabricate an out-of-window context edge.
+        created_at = self._sleep_now().isoformat()
+        payload = {"context_id": "seedctx_%s" % uuid4().hex, "run_id": run_id,
+                   "directive": "request_human_review", "seed_authorities": authorities,
+                   "context_digest": "0" * 64, "created_at": created_at,
+                   "version": "expedition_seed_context_v1"}
+        payload["context_digest"] = SQLiteEventStore.expedition_seed_context_digest(payload)
+        return self.event_store.append(CognitiveEvent(
+            session_id=self.session_id, kind=EventKind.EXPEDITION_SEED_CONTEXT,
+            source_kind=SourceKind.POLICY, source_ref="SeedGuidanceProjector",
+            payload=payload, created_at=created_at,
+            parent_event_ids=(consumption_event_id,) + tuple(
+                item.current_authority_event_id for item in guidance)))
+
     def purge_session(self, confirmed: bool = False) -> Dict[str, Any]:
         """Delete logical records; direct file stores are never physical-purge claims."""
         if not confirmed:
@@ -2203,9 +2414,11 @@ class StrangeloopAgent:
                           source_ref: str = "user") -> CognitiveEvent:
         """Record a bounded conflict between two prior observable records.
 
-        A correction preserves history and requests review; it cannot retire a
-        seed or revoke a self-model claim. Those high-impact changes retain
-        their separate, explicit user-confirmation flows.
+        A correction always preserves history and requests review.  When it is
+        USER-sourced and a standing seed policy is active, the host may also
+        tighten or retire a causally related seed within that policy's limits.
+        Other sources only create the correction record.  Self-model claims
+        retain their separate explicit revocation flow.
         """
         permitted_sources = {
             SourceKind.USER, SourceKind.TOOL, SourceKind.EXTERNAL_VERIFIER,
@@ -2229,7 +2442,7 @@ class StrangeloopAgent:
         }
         if counterevidence.kind not in allowed_counterevidence:
             raise ValueError("counterevidence must be an observation or action result")
-        return self.event_store.append(CognitiveEvent(
+        correction = self.event_store.append(CognitiveEvent(
             session_id=self.session_id,
             kind=EventKind.CORRECTION,
             source_kind=source_kind,
@@ -2242,6 +2455,8 @@ class StrangeloopAgent:
             },
             parent_event_ids=(target_event_id, counterevidence_event_id),
         ))
+        self._auto_process_seed_correction(correction, target_event_id)
+        return correction
 
     def export_session(self) -> Dict[str, Any]:
         """Export inspectable, current logical-session records."""
@@ -2263,6 +2478,7 @@ class StrangeloopAgent:
             "claims": [claim.statement for claim in self.self_model.current_claims(self.session_id)],
             "active_seed_ids": [seed.seed_id for seed in self.seed_store.list(self.session_id)
                                 if seed.status.value == "active"],
+            "seed_auto_update": self.seed_auto_update_status(),
             "event_count": len(self.event_store.list(self.session_id)),
             "loop": self.loop_status(),
             "provider": self.provider_status(),
@@ -2874,15 +3090,10 @@ class StrangeloopAgent:
     def _server_seed_candidate(user_text: str, observation_id: str,
                                decision_id: str) -> SeedDisposition:
         """Create a bounded candidate without trusting any model-supplied seed fields."""
-        tokens = []
-        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{1,23}", user_text.lower()):
-            if token not in tokens:
-                tokens.append(token)
-            if len(tokens) == 2:
-                break
+        tokens = StrangeloopAgent._seed_cue_terms(user_text)
         # SeedDisposition requires at least one cue.  This fixed fallback makes
-        # non-Latin or punctuation-only input safe without adopting model text.
-        cue_terms = tuple(tokens) if tokens else ("current-input",)
+        # punctuation-only input safe without adopting model text.
+        cue_terms = tokens if tokens else ("current-input",)
         return SeedDisposition(
             cue_terms=cue_terms,
             policy_bias="request-human-review",
@@ -2891,6 +3102,144 @@ class StrangeloopAgent:
             strength=0.25,
             confidence=0.25,
         )
+
+    @staticmethod
+    def _seed_cue_terms(user_text: str) -> Tuple[str, ...]:
+        """Project public input into the deterministic bounded seed vocabulary."""
+        tokens = []
+        # Latin words and bounded CJK runs are both host-tokenized.  CJK runs
+        # become overlapping two-character cues because whitespace cannot be
+        # assumed to mark words.  Sorting the bounded lexical cues makes a
+        # simple leading phrase less likely to create a duplicate identity.
+        # This remains a deterministic text projection, not model semantics.
+        pattern = (r"[A-Za-z0-9][A-Za-z0-9_-]{1,23}"
+                   r"|[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]{1,24}")
+        for token in re.findall(pattern, user_text.casefold()):
+            is_cjk = not token[0].isascii()
+            projected = ([token[index:index + 2]
+                          for index in range(len(token) - 1)]
+                         if is_cjk and len(token) > 1 else [token])
+            tokens.extend(projected)
+        return tuple(sorted(set(tokens))[:2])
+
+    def _auto_process_text_seed(self, user_text: str, observation_id: str,
+                                decision_id: str) -> Tuple[Tuple[str, ...], str]:
+        """Apply one bounded post-turn seed action under standing authority.
+
+        The identity lookup, policy preflight, proposal, and application share
+        one write transaction.  This prevents two processes handling the same
+        session from both persisting a candidate for one lexical identity.
+        """
+        candidate = self._server_seed_candidate(user_text, observation_id, decision_id)
+        identity = canonical_seed_identity(candidate)
+        try:
+            with self.event_store.transaction():
+                # Re-read only after BEGIN IMMEDIATE has serialized writers;
+                # a pre-transaction snapshot is insufficient across SQLite
+                # connections sharing the same session database.
+                matching = [seed for seed in self.seed_store.list(self.session_id)
+                            if canonical_seed_identity(seed) == identity]
+                # A retired lexical identity is a tombstone.  It is never
+                # revived by changing a generated seed ID, and an existing
+                # candidate is not retroactively activated by a later policy.
+                if any(seed.status.value == "retired" for seed in matching):
+                    return (), "retired_identity"
+                active = next((seed for seed in matching
+                               if seed.status.value == "active"), None)
+                if active is not None:
+                    policy = self.seed_store.standing_policy_status(self.session_id)
+                    if (policy is None or policy.get("status") != "active"
+                            or policy["auto_updates_used"] >= policy["max_auto_updates"]):
+                        return (), "update_budget_exhausted"
+                    proposal = self.seed_store.propose_seed_update(
+                        active.seed_id, "reinforce", observation_id,
+                        source_ref="server_seed_projection")
+                    applied = self.seed_store.auto_apply_update(proposal.event_id)
+                    return (), "reinforce" if applied is not None else "no_change"
+                if matching:
+                    return (), "existing_candidate"
+                policy = self.seed_store.standing_policy_status(self.session_id)
+                active_count = sum(
+                    seed.status.value == "active"
+                    for seed in self.seed_store.list(self.session_id)
+                )
+                if policy is None or policy.get("status") != "active":
+                    return (), "policy_inactive"
+                if policy["auto_activations_used"] >= policy["max_auto_activations"]:
+                    return (), "activation_budget_exhausted"
+                if active_count >= policy["max_active_seeds"]:
+                    return (), "active_seed_cap_reached"
+                stored = self.seed_store.propose(
+                    self.session_id, candidate, source_ref="server_seed_projection")
+                applied = self.seed_store.auto_apply_candidate(stored.seed_id)
+        except (KeyError, RuntimeError, ValueError):
+            return (), "rejected"
+        return ((stored.seed_id,), "activate" if applied is not None else "rejected")
+
+    def auto_seed_from_expedition_goal(self, goal: str, user_observation_event_id: str,
+                                       decision_event_id: str) -> Tuple[Tuple[str, ...], str]:
+        """Apply the standing policy to one explicit CLI expedition goal.
+
+        The caller supplies the exact USER goal observation and a host policy
+        decision bound to it.  This method accepts no model proposal, tool output, experiment result,
+        reward, TD value, quota, sleep, or lifecycle record as seed evidence.
+        """
+        observation = self.event_store.get(user_observation_event_id)
+        decision = self.event_store.get(decision_event_id)
+        if (observation is None or observation.session_id != self.session_id
+                or observation.kind != EventKind.OBSERVATION
+                or observation.source_kind != SourceKind.USER
+                or decision is None or decision.session_id != self.session_id
+                or decision.kind != EventKind.DECISION
+                or tuple(decision.parent_event_ids) != (observation.event_id,)):
+            raise ValueError("expedition seed input requires exact USER observation and bound policy decision")
+        if self.seed_auto_update_status().get("state") != "active":
+            return (), "policy_inactive"
+        return self._auto_process_text_seed(goal, user_observation_event_id,
+                                            decision_event_id)
+
+    def _auto_process_seed_correction(self, correction: CognitiveEvent,
+                                      target_event_id: str) -> None:
+        """Tighten a causally related active seed; retire at policy bounds."""
+        if correction.source_kind != SourceKind.USER:
+            return
+        ancestry, pending = set(), [target_event_id]
+        # Event parent traversal is bounded and uses only public provenance.
+        while pending and len(ancestry) < 64:
+            event_id = pending.pop()
+            if event_id in ancestry:
+                continue
+            ancestry.add(event_id)
+            event = self.event_store.get(event_id)
+            if event is not None:
+                pending.extend(event.parent_event_ids[:8])
+        try:
+            # Serialize correction budget/version checks with their proposal
+            # and application for the same cross-process reason as text turns.
+            with self.event_store.transaction():
+                policy = self.seed_store.standing_policy_status(self.session_id)
+                if policy is None or policy.get("status") != "active":
+                    return
+                for seed in self.seed_store.list(self.session_id):
+                    if (seed.status.value != "active"
+                            or not ancestry.intersection(seed.provenance_event_ids)):
+                        continue
+                    policy = self.seed_store.standing_policy_status(self.session_id)
+                    if policy["auto_updates_used"] >= policy["max_auto_updates"]:
+                        return
+                    operation = "retire" if (
+                        seed.counterevidence + 1 >= policy["max_counterevidence"]
+                        or seed.strength <= policy["max_strength_step"]
+                        or seed.confidence <= policy["max_confidence_step"]
+                    ) else "tighten"
+                    proposal = self.seed_store.propose_seed_update(
+                        seed.seed_id, operation, correction.event_id,
+                        source_ref="server_seed_projection")
+                    self.seed_store.auto_apply_update(proposal.event_id)
+        except (KeyError, RuntimeError, ValueError):
+            # The correction remains inspectable if a concurrent lifecycle
+            # change makes bounded automatic maintenance ineligible.
+            return
 
     @staticmethod
     def _claim_export(claim: Any) -> dict:

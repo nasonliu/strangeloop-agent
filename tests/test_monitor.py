@@ -472,6 +472,46 @@ class MonitorTests(unittest.TestCase):
         proposed = project_event(self.records[1])
         self.assertNotIn("input", proposed["payload"])
 
+    def test_standing_seed_policy_projection_is_aggregate_and_redacted(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        prior = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        records = [
+            event(20, "seed_standing_policy", {"expires_at": future,
+                "policy_id": "policy_active", "nonce": "nonce_secret",
+                "policy_digest": "a" * 64, "cue_terms": ["private-cue"],
+                "provenance_event_ids": ["evt_private"]}),
+            event(21, "seed_standing_policy", {"expires_at": prior,
+                "policy_id": "policy_expired", "nonce": "nonce_expired",
+                "policy_digest": "b" * 64}),
+            event(22, "seed_standing_policy", {"expires_at": future,
+                "policy_id": "policy_revoked", "nonce": "nonce_revoked",
+                "policy_digest": "c" * 64}),
+            event(23, "seed_standing_policy_revoked", {"policy_event_id": "evt_22",
+                "policy_id": "policy_revoked", "nonce": "must_not_show"}),
+            event(24, "seed_auto_applied", {"policy_event_id": "evt_20",
+                "operation": "activate", "seed_id": "seed_private",
+                "cue_terms": ["private-cue"], "provenance_event_ids": ["evt_private"]}),
+            event(25, "seed_auto_applied", {"policy_event_id": "evt_20",
+                "operation": "reinforce", "seed_id": "seed_private"}),
+        ]
+        projected = _state_projection({}, [project_event(record) for record in records])
+        status = projected["standing_seed_policy"]
+        self.assertEqual({"active_count": 1, "revoked_count": 1, "expired_count": 1,
+                          "auto_activation_count": 1, "auto_update_count": 1},
+                         {key: status[key] for key in ("active_count", "revoked_count", "expired_count",
+                                                        "auto_activation_count", "auto_update_count")})
+        encoded = json.dumps({"status": status,
+                              "events": [project_event(record) for record in records]})
+        for forbidden in ("policy_active", "policy_expired", "nonce_",
+                          "private-cue", "evt_private", "seed_private", "policy_digest"):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_standing_policy_card_uses_text_content_only(self):
+        page = dashboard_html()
+        self.assertIn('id="standingSeedPolicy"', page)
+        self.assertIn("byId('standingSeedPolicy').textContent", page)
+        self.assertNotIn("innerHTML", page)
+
     def test_mirror_projection_only_exposes_fixed_checkable_fields(self):
         projected = project_event(self.records[3])
         payload = projected["payload"]

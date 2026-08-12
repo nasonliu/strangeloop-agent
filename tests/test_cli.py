@@ -27,6 +27,97 @@ from strangeloop.kimi_cli import KimiCliUsageResult, ManagedUsageWindow
 
 
 class CliTests(unittest.TestCase):
+    def test_seed_auto_flag_is_explicit_and_bounded(self):
+        args = build_parser().parse_args(["--seed-auto-update"])
+        self.assertTrue(args.seed_auto_update)
+
+    def test_seed_auto_repl_start_status_and_stop_are_single_user_actions(self):
+        agent = StrangeloopAgent(session_id="seed-auto-cli")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            run_repl(agent, ["/seed-auto start", "/seed-auto status",
+                             "/seed-auto start", "/seed-auto stop",
+                             "/seed-auto status", "/quit"])
+        events = agent.event_store.list(agent.session_id)
+        kinds = [event.kind for event in events]
+        self.assertEqual(1, kinds.count(EventKind.SEED_STANDING_POLICY))
+        self.assertEqual(1, kinds.count(EventKind.SEED_STANDING_POLICY_REVOKED))
+        self.assertNotIn(EventKind.SEED_APPROVED, kinds)
+
+        approvals = [event for event in events
+                     if event.kind == EventKind.OBSERVATION
+                     and event.payload.get("approval") == "seed_standing_policy"]
+        revocations = [event for event in events
+                       if event.kind == EventKind.OBSERVATION
+                       and event.payload.get("approval") == "seed_standing_policy_revoke"]
+        self.assertEqual(1, len(approvals))
+        self.assertEqual(SourceKind.USER, approvals[0].source_kind)
+        self.assertEqual({"approval", "policy_digest", "nonce"},
+                         set(approvals[0].payload))
+        self.assertEqual(1, len(revocations))
+        self.assertEqual(SourceKind.USER, revocations[0].source_kind)
+        self.assertEqual({"approval", "policy_id", "policy_event_id"},
+                         set(revocations[0].payload))
+
+        public_lines = [json.loads(line) for line in output.getvalue().splitlines()
+                        if line.startswith("{")]
+        self.assertEqual("active", public_lines[0]["state"])
+        self.assertFalse(public_lines[0]["per_seed_confirmation_required"])
+        self.assertEqual("revoked", public_lines[-1]["state"])
+        self.assertTrue(public_lines[-1]["per_seed_confirmation_required"])
+        rendered = json.dumps(public_lines, sort_keys=True)
+        for private_key in ("policy_id", "event_id", "nonce", "policy_digest"):
+            self.assertNotIn(private_key, rendered)
+
+    def test_seed_auto_startup_flag_issues_policy_before_repl_once(self):
+        observed = {}
+
+        def capture(agent, **kwargs):
+            del kwargs
+            events = agent.event_store.list(agent.session_id)
+            observed["status"] = agent.seed_auto_update_status()
+            observed["kinds"] = [event.kind for event in events]
+            observed["approval_payloads"] = [event.payload for event in events
+                if event.kind == EventKind.OBSERVATION
+                and event.payload.get("approval") == "seed_standing_policy"]
+
+        output = io.StringIO()
+        with patch("strangeloop.cli.run_repl", side_effect=capture), \
+             patch("strangeloop.cli.KimiCliManagedUsageAdapter.refresh_controller",
+                   return_value=KimiCliUsageResult(None, "unavailable")), \
+             redirect_stdout(output):
+            self.assertEqual(0, main(["--session", "seed-auto-main",
+                                      "--seed-auto-update"]))
+        self.assertEqual("active", observed["status"]["state"])
+        self.assertEqual(1, observed["kinds"].count(EventKind.SEED_STANDING_POLICY))
+        self.assertEqual(1, len(observed["approval_payloads"]))
+        self.assertNotIn(EventKind.SEED_APPROVED, observed["kinds"])
+        self.assertIn('"state": "active"', output.getvalue())
+
+    def test_seed_auto_expedition_goal_activates_without_per_seed_approval(self):
+        observed = {}
+
+        def capture(agent, **kwargs):
+            del kwargs
+            events = agent.event_store.list(agent.session_id)
+            observed["kinds"] = [event.kind for event in events]
+            observed["seeds"] = agent.seed_store.list(agent.session_id)
+            observed["contexts"] = [event for event in events
+                                    if event.kind == EventKind.EXPEDITION_SEED_CONTEXT]
+
+        with patch("strangeloop.cli.run_repl", side_effect=capture), \
+             patch("strangeloop.cli._run_expedition_foreground"), \
+             patch("strangeloop.cli.KimiCliOAuthUsageBridge.refresh_controller"):
+            self.assertEqual(0, main([
+                "--session", "seed-auto-expedition", "--seed-auto-update", "--expedition",
+                "--expedition-goal", "research curiosity verification",
+            ]))
+        self.assertNotIn(EventKind.SEED_APPROVED, observed["kinds"])
+        self.assertEqual(1, len(observed["seeds"]))
+        self.assertEqual("active", observed["seeds"][0].status.value)
+        self.assertEqual(1, len(observed["contexts"]))
+        self.assertEqual("policy", observed["contexts"][0].source_kind.value)
+
     def test_expedition_and_unattended_modes_cannot_compete_for_one_controller(self):
         with self.assertRaises(SystemExit):
             main(["--expedition", "--unattended"])

@@ -27,6 +27,14 @@ Strangeloop 是受唯识认知理论启发的可审计软件。它不具有、�
 标准库 `sqlite3` 不能把数据库、WAL 与 SHM 的打开绑定到 `dir_fd`。实现只能在普通路径打开前后校验固定目录 inode，故**不防同一 UID 的恶意代码**在校验后竞态替换路径。生产环境应使用 OS sandbox、独立服务/独立 UID，或支持 `openat` 语义的 SQLite VFS。这不保证 SSD、备份、快照、日志或受控根目录外副本的擦除；不得宣称“不可恢复”或“物理擦除”。
 - 不把不确定推断、敏感属性、诊断、政治/宗教归类或短暂情绪自动提升为持久记忆。
 
+### Seed auto-update（低影响例外）
+
+逐条 `USER` 审批仍是默认路径。用户一次性显式启用 seed auto-update 后，内部 standing authorization 未到期、未撤销且额度/范围仍满足时，宿主自动对低影响种子做确定性 `activate`、有界 `reinforce`、只收紧的 `tighten` 或 `retire`；不需要逐种子再次批准，效果只能在下一 turn 检索。启用必须是精确绑定 policy manifest digest 与 nonce 的 `USER OBSERVATION`，普通用户文本、模型、工具、网页、奖励、TD、实验或生命周期事件均不能充当授权或强化证据。
+
+- 模型只能提出候选/更新建议，不能自行批准、续期、扩大限制、撤销或复活退役/已 purge 种子；语义 clone 换 ID、重复 replay 和陈旧 CAS 都必须失败关闭。
+- 该政策不改变 capability/grant、quota、sleep/wake、stop、reward/RPE/TD 或 self-model；不会训练、微调或部署模型权重。
+- 种子仍可查看、导出、撤销和 purge。localhost monitor 仅显示 active/revoked/expired 与自动 application 的聚合计数，不显示 cues、来源、nonce、digest、限制或证据；它不是控制面。完整协议见 [RFC-0005](RFC-0005-standing-seed-policy.md)。
+
 ## 宗教谦抑
 
 项目使用唯识术语作设计启发，不解释、替代或认证任何宗教传统。UI、文档和示例应同时说明原义、工程类比及其边界；不把软件行为称为“修行成果”“证悟”“转识成智”或“佛法验证”。有关概念与原典参照见 [GLOSSARY.md](GLOSSARY.md)。

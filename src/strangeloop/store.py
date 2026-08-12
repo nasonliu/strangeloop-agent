@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
 import re
 import sqlite3
 import time
-from typing import Any, Dict, Iterator, List, Optional
+import unicodedata
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .contracts import (CognitiveEvent, EventKind, SourceKind,
                         FRONTIER_OFFLINE_EXPERIMENT_ACTION_MODE,
@@ -39,10 +40,12 @@ SLEEP_WAKE_EVENT_KINDS = frozenset((
     EventKind.UNATTENDED_WAKE_RUN,
     EventKind.EXPEDITION_AUTHORIZATION,
     EventKind.EXPEDITION_AUTHORIZATION_CONSUMED,
+    EventKind.EXPEDITION_SEED_CONTEXT,
 ))
 NON_EVIDENCE_LIFECYCLE_EVENT_KINDS = SLEEP_WAKE_EVENT_KINDS | frozenset((
     EventKind.EXPEDITION_AUTHORIZATION,
     EventKind.EXPEDITION_AUTHORIZATION_CONSUMED,
+    EventKind.EXPEDITION_SEED_CONTEXT,
 ))
 FRONTIER_CHANNEL_ORDER = (
     "functional_continuity", "bounded_curiosity", "operational_integrity",
@@ -61,6 +64,10 @@ FRONTIER_FORBIDDEN_EVIDENCE_KINDS = NON_EVIDENCE_LIFECYCLE_EVENT_KINDS | frozens
     EventKind.CAPABILITY_GRANTED, EventKind.CAPABILITY_REVOKED,
     EventKind.AUTONOMY_CONTROL, EventKind.AUTONOMY_STOPPED,
     EventKind.SEED_PROPOSED, EventKind.SEED_APPROVED, EventKind.SEED_RETIRED,
+    EventKind.SEED_STANDING_POLICY, EventKind.SEED_STANDING_POLICY_REVOKED,
+    EventKind.SEED_UPDATE_PROPOSED, EventKind.SEED_AUTO_ELIGIBILITY,
+    EventKind.SEED_AUTO_APPLIED,
+    EventKind.EXPEDITION_SEED_CONTEXT,
     EventKind.SELF_CLAIM_PROPOSED, EventKind.SELF_CLAIM_APPROVED,
     EventKind.SELF_CLAIM_REVOKED, EventKind.PURGE,
     EventKind.EXPERIMENT_PLAN_LOCKED, EventKind.EXPERIMENT_EXECUTION_STARTED,
@@ -77,6 +84,14 @@ EXPERIMENT_EVENT_KINDS = frozenset((
     EventKind.EXPERIMENT_PLAN_LOCKED, EventKind.EXPERIMENT_EXECUTION_STARTED,
     EventKind.EXPERIMENT_RESULT,
 ))
+SEED_AUTO_OPERATIONS = frozenset(("activate", "reinforce", "tighten", "retire"))
+SEED_AUTO_UPDATE_OPERATIONS = frozenset(("reinforce", "tighten", "retire"))
+SEED_AUTO_EVENT_KINDS = frozenset((
+    EventKind.SEED_STANDING_POLICY, EventKind.SEED_STANDING_POLICY_REVOKED,
+    EventKind.SEED_UPDATE_PROPOSED, EventKind.SEED_AUTO_ELIGIBILITY,
+    EventKind.SEED_AUTO_APPLIED,
+))
+SEED_AUTO_CLOCK_SKEW_SECONDS = 5
 
 
 def frontier_experiment_reward_vector(experiment_kind: str, status: str,
@@ -120,6 +135,11 @@ ALLOWED_EVENT_SOURCES = {
     EventKind.SEED_PROPOSED: frozenset((SourceKind.MODEL,)),
     EventKind.SEED_APPROVED: frozenset((SourceKind.USER,)),
     EventKind.SEED_RETIRED: frozenset((SourceKind.USER,)),
+    EventKind.SEED_STANDING_POLICY: frozenset((SourceKind.USER,)),
+    EventKind.SEED_STANDING_POLICY_REVOKED: frozenset((SourceKind.USER,)),
+    EventKind.SEED_UPDATE_PROPOSED: frozenset((SourceKind.MODEL,)),
+    EventKind.SEED_AUTO_ELIGIBILITY: frozenset((SourceKind.POLICY,)),
+    EventKind.SEED_AUTO_APPLIED: frozenset((SourceKind.POLICY,)),
     EventKind.SELF_CLAIM_PROPOSED: frozenset((SourceKind.MODEL, SourceKind.USER)),
     EventKind.SELF_CLAIM_APPROVED: frozenset((SourceKind.USER,)),
     EventKind.SELF_CLAIM_REVOKED: frozenset((SourceKind.USER,)),
@@ -158,12 +178,13 @@ ALLOWED_EVENT_SOURCES = {
     EventKind.UNATTENDED_WAKE_RUN: frozenset((SourceKind.SYSTEM,)),
     EventKind.EXPEDITION_AUTHORIZATION: frozenset((SourceKind.USER,)),
     EventKind.EXPEDITION_AUTHORIZATION_CONSUMED: frozenset((SourceKind.SYSTEM,)),
+    EventKind.EXPEDITION_SEED_CONTEXT: frozenset((SourceKind.POLICY,)),
 }
 
 # Persisted records are intentionally small public projections.  This is a
 # schema boundary, not merely a list of forbidden reasoning-key substrings.
 PAYLOAD_KEYS = {
-    EventKind.OBSERVATION: frozenset(("content", "channel", "approval", "seed_id", "claim_id", "proposal_event_id")),
+    EventKind.OBSERVATION: frozenset(("content", "channel", "approval", "seed_id", "claim_id", "proposal_event_id", "policy_digest", "nonce", "policy_id", "policy_event_id")),
     EventKind.MEDIA_OBSERVATION: frozenset(("artifact_id", "modality", "sha256", "mime_type", "byte_length", "received_at", "duration_ms", "retention_scope")),
     EventKind.PERCEPT: frozenset(("percept_id", "artifact_id", "artifact_sha256", "modality", "span_start_ms", "span_end_ms", "percept_kind", "value", "confidence", "adapter_id", "adapter_version")),
     EventKind.MODEL_INVOCATION: frozenset(("invocation_id", "run_id", "trigger_event_id", "provider", "model", "role", "outcome", "latency_ms", "context_scope", "public_summary")),
@@ -184,6 +205,33 @@ PAYLOAD_KEYS = {
     EventKind.SEED_PROPOSED: frozenset(("seed",)),
     EventKind.SEED_APPROVED: frozenset(("seed_id", "proposal_event_id", "approval_event_id")),
     EventKind.SEED_RETIRED: frozenset(("seed_id", "reason")),
+    EventKind.SEED_STANDING_POLICY: frozenset((
+        "policy_id", "user_observation_event_id", "nonce", "issued_at", "expires_at",
+        "scope", "max_auto_activations", "max_auto_updates", "max_active_seeds",
+        "max_cue_terms", "max_cue_length", "max_strength", "max_confidence",
+        "max_seed_ttl_seconds", "max_strength_step", "max_confidence_step",
+        "max_counterevidence", "max_seed_versions", "allowed_policy_bias",
+        "policy_version",
+    )),
+    EventKind.SEED_STANDING_POLICY_REVOKED: frozenset((
+        "revocation_id", "policy_id", "policy_event_id", "reason", "revoked_at", "version",
+    )),
+    EventKind.SEED_UPDATE_PROPOSED: frozenset((
+        "proposal_id", "seed_id", "base_event_id", "base_version", "operation",
+        "proposed_seed", "delta_digest", "version",
+    )),
+    EventKind.SEED_AUTO_ELIGIBILITY: frozenset((
+        "eligibility_id", "policy_id", "policy_event_id", "proposal_event_id",
+        "seed_id", "base_event_id", "base_version", "operation", "decision",
+        "reason", "auto_activations_used", "auto_updates_used", "active_seeds",
+        "evaluated_at", "version",
+    )),
+    EventKind.SEED_AUTO_APPLIED: frozenset((
+        "application_id", "eligibility_event_id", "policy_id", "policy_event_id",
+        "proposal_event_id", "seed_id", "base_event_id", "base_version",
+        "new_version", "operation", "prior_seed_digest", "new_seed_digest",
+        "applied_at", "version",
+    )),
     EventKind.SELF_CLAIM_PROPOSED: frozenset(("claim", "state")),
     EventKind.SELF_CLAIM_APPROVED: frozenset(("claim", "proposal_event_id", "approval_event_id")),
     EventKind.SELF_CLAIM_REVOKED: frozenset(("claim_id", "reason")),
@@ -282,6 +330,10 @@ PAYLOAD_KEYS = {
     EventKind.EXPEDITION_AUTHORIZATION_CONSUMED: frozenset((
         "consumption_id", "authorization_id", "consumed_at", "run_id", "version",
     )),
+    EventKind.EXPEDITION_SEED_CONTEXT: frozenset((
+        "context_id", "run_id", "directive", "seed_authorities", "context_digest",
+        "created_at", "version",
+    )),
 }
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
@@ -305,10 +357,13 @@ class SQLiteEventStore:
     name prior, same-session event IDs as parents.
     """
 
-    def __init__(self, path: str = ":memory:", session_id: Optional[str] = None) -> None:
+    def __init__(self, path: str = ":memory:", session_id: Optional[str] = None,
+                 trusted_clock: Optional[Callable[[], datetime]] = None) -> None:
         self.path = path
         self.session_id = session_id
         self._is_file = path != ":memory:"
+        self._savepoint_counter = 0
+        self._trusted_clock = trusted_clock or (lambda: datetime.now(timezone.utc))
         self.connection = sqlite3.connect(path, timeout=0.1, isolation_level=None)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA busy_timeout = 5000")
@@ -336,7 +391,19 @@ class SQLiteEventStore:
     def transaction(self) -> Iterator[None]:
         """Run a write transaction, retrying lock acquisition for file stores."""
         if self.connection.in_transaction:
-            yield
+            self._savepoint_counter += 1
+            name = "strangeloop_nested_%d" % self._savepoint_counter
+            self.connection.execute("SAVEPOINT " + name)
+            try:
+                yield
+                self.connection.execute("RELEASE SAVEPOINT " + name)
+            except BaseException:
+                try:
+                    self.connection.execute("ROLLBACK TO SAVEPOINT " + name)
+                    self.connection.execute("RELEASE SAVEPOINT " + name)
+                except BaseException:
+                    pass
+                raise
             return
         last_error = None
         for attempt in range(8):
@@ -396,6 +463,13 @@ class SQLiteEventStore:
             raise ValueError("event session does not match this session-bound store")
         if event.source_kind not in ALLOWED_EVENT_SOURCES[event.kind]:
             raise ValueError("event source is not allowed for kind %s" % event.kind.value)
+        if event.kind in (EventKind.SEED_AUTO_ELIGIBILITY, EventKind.SEED_AUTO_APPLIED):
+            trusted_now = self._trusted_clock()
+            if trusted_now.tzinfo is None or trusted_now.utcoffset() is None:
+                raise ValueError("trusted clock must return a timezone-aware datetime")
+            event_time = parse_aware_iso8601(event.created_at)
+            if abs((event_time - trusted_now).total_seconds()) > SEED_AUTO_CLOCK_SKEW_SECONDS:
+                raise ValueError("automatic seed event time does not match the trusted host clock")
         encoded = canonical_json(event.payload).encode("utf-8")
         if len(encoded) > MAX_PAYLOAD_BYTES:
             raise ValueError("payload exceeds the structured-record size limit")
@@ -429,6 +503,11 @@ class SQLiteEventStore:
             "SELECT * FROM cognitive_events WHERE event_id IN (" + placeholders + ")",
             tuple(event.parent_event_ids),
         ).fetchall()}
+        if event.kind in SEED_AUTO_EVENT_KINDS:
+            event_time = parse_aware_iso8601(event.created_at)
+            if any(event_time < parse_aware_iso8601(parent.created_at)
+                   for parent in parent_events.values()):
+                raise ValueError("automatic seed event time cannot predate a parent event")
         self._validate_lineage(event, parent_events)
 
     def _validate_protocol_uniqueness(self, event: CognitiveEvent,
@@ -477,6 +556,12 @@ class SQLiteEventStore:
             EventKind.EXPERIMENT_PLAN_LOCKED: "experiment_id",
             EventKind.EXPERIMENT_EXECUTION_STARTED: "execution_id",
             EventKind.EXPERIMENT_RESULT: "result_id",
+            EventKind.SEED_STANDING_POLICY: "policy_id",
+            EventKind.SEED_STANDING_POLICY_REVOKED: "revocation_id",
+            EventKind.SEED_UPDATE_PROPOSED: "proposal_id",
+            EventKind.SEED_AUTO_ELIGIBILITY: "eligibility_id",
+            EventKind.SEED_AUTO_APPLIED: "application_id",
+            EventKind.EXPEDITION_SEED_CONTEXT: "context_id",
         }
         if event.kind == EventKind.TOOL_RESULT and "execution_id" in event.payload:
             if any(payload.get("execution_id") == event.payload["execution_id"]
@@ -534,6 +619,67 @@ class SQLiteEventStore:
                 if any(payload.get("execution_id") == event.payload["execution_id"]
                        for _, payload in records(EventKind.EXPERIMENT_RESULT)):
                     raise ValueError("experiment execution already has a verifier result")
+            if event.kind == EventKind.SEED_STANDING_POLICY:
+                if any(payload.get("nonce") == event.payload["nonce"]
+                       for _, payload in records(EventKind.SEED_STANDING_POLICY)):
+                    raise ValueError("standing seed policy nonce has already been recorded")
+                if any(payload.get("user_observation_event_id") == event.payload["user_observation_event_id"]
+                       for _, payload in records(EventKind.SEED_STANDING_POLICY)):
+                    raise ValueError("standing seed policy approval has already been consumed")
+            if event.kind == EventKind.SEED_STANDING_POLICY_REVOKED:
+                if any(payload.get("policy_event_id") == event.payload["policy_event_id"]
+                       for _, payload in records(EventKind.SEED_STANDING_POLICY_REVOKED)):
+                    raise ValueError("standing seed policy has already been revoked")
+            if event.kind == EventKind.SEED_UPDATE_PROPOSED:
+                if any(payload.get("base_event_id") == event.payload["base_event_id"]
+                       for _, payload in records(EventKind.SEED_UPDATE_PROPOSED)):
+                    raise ValueError("seed authority already has an update proposal")
+                rows = self.connection.execute(
+                    "SELECT parent_event_ids_json FROM cognitive_events "
+                    "WHERE session_id = ? AND kind = ?",
+                    (event.session_id, EventKind.SEED_UPDATE_PROPOSED.value),
+                ).fetchall()
+                evidence_event_id = (event.parent_event_ids[1]
+                                     if len(event.parent_event_ids) == 2 else None)
+                evidence_record = self.get(evidence_event_id) if evidence_event_id else None
+                counterevidence_id = (evidence_record.payload.get("counterevidence_event_id")
+                                      if evidence_record is not None
+                                      and evidence_record.kind == EventKind.CORRECTION
+                                      else evidence_event_id)
+                consumed = set()
+                for row in rows:
+                    parent_ids = json.loads(row["parent_event_ids_json"])
+                    if len(parent_ids) != 2:
+                        continue
+                    prior_evidence = self.get(parent_ids[1])
+                    consumed.add(
+                        prior_evidence.payload.get("counterevidence_event_id")
+                        if prior_evidence is not None
+                        and prior_evidence.kind == EventKind.CORRECTION
+                        else parent_ids[1])
+                if counterevidence_id is not None and counterevidence_id in consumed:
+                    raise ValueError("seed update evidence has already been consumed")
+            if event.kind == EventKind.SEED_AUTO_ELIGIBILITY:
+                if any(payload.get("proposal_event_id") == event.payload["proposal_event_id"]
+                       and payload.get("policy_event_id") == event.payload["policy_event_id"]
+                       for _, payload in records(EventKind.SEED_AUTO_ELIGIBILITY)):
+                    raise ValueError("seed proposal already has a decision under this policy")
+            if event.kind == EventKind.SEED_AUTO_APPLIED:
+                if any(payload.get("eligibility_event_id") == event.payload["eligibility_event_id"]
+                       for _, payload in records(EventKind.SEED_AUTO_APPLIED)):
+                    raise ValueError("seed eligibility decision has already been applied")
+                if event.payload["operation"] == "activate":
+                    if any(payload.get("proposal_event_id") == event.payload["proposal_event_id"]
+                           for _, payload in records(EventKind.SEED_APPROVED)):
+                        raise ValueError("seed proposal already has a user activation")
+                    if any(payload.get("proposal_event_id") == event.payload["proposal_event_id"]
+                           and payload.get("operation") == "activate"
+                           for _, payload in records(EventKind.SEED_AUTO_APPLIED)):
+                        raise ValueError("seed proposal already has an automatic activation")
+                if event.payload["base_event_id"] is not None and any(
+                        payload.get("base_event_id") == event.payload["base_event_id"]
+                        for _, payload in records(EventKind.SEED_AUTO_APPLIED)):
+                    raise ValueError("seed base version already has an applied successor")
             successor_fields = {
                 EventKind.WAKE_READY: "wake_check_event_id",
                 EventKind.AWAKE: "wake_ready_event_id",
@@ -572,6 +718,34 @@ class SQLiteEventStore:
             if any(payload.get("reward_event_id") == event.payload["reward_event_id"]
                    for _, payload in records(EventKind.RPE_UPDATE)):
                 raise ValueError("reward event has already been consumed by an RPE update")
+        elif event.kind == EventKind.SEED_PROPOSED:
+            seed_id = event.payload["seed"]["seed_id"]
+            if any(payload.get("seed", {}).get("seed_id") == seed_id
+                   for _, payload in records(EventKind.SEED_PROPOSED)):
+                raise ValueError("seed_id has already been proposed in this session")
+            if any(payload.get("seed_id") == seed_id
+                   for kind in (EventKind.SEED_RETIRED, EventKind.SEED_AUTO_APPLIED)
+                   for _, payload in records(kind)
+                   if kind != EventKind.SEED_AUTO_APPLIED or payload.get("operation") == "retire"):
+                raise ValueError("retired seed_id cannot be proposed again")
+        elif event.kind == EventKind.SEED_APPROVED:
+            if any(payload.get("proposal_event_id") == event.payload["proposal_event_id"]
+                   for _, payload in records(EventKind.SEED_APPROVED)):
+                raise ValueError("seed proposal already has a user activation")
+            if any(payload.get("proposal_event_id") == event.payload["proposal_event_id"]
+                   and payload.get("operation") == "activate"
+                   for _, payload in records(EventKind.SEED_AUTO_APPLIED)):
+                raise ValueError("seed proposal already has an automatic activation")
+            if any(payload.get("approval_event_id") == event.payload["approval_event_id"]
+                   for _, payload in records(EventKind.SEED_APPROVED)):
+                raise ValueError("seed approval observation has already been consumed")
+        elif event.kind == EventKind.SEED_RETIRED:
+            if (any(payload.get("seed_id") == event.payload["seed_id"]
+                    for _, payload in records(EventKind.SEED_RETIRED))
+                    or any(payload.get("seed_id") == event.payload["seed_id"]
+                           and payload.get("operation") == "retire"
+                           for _, payload in records(EventKind.SEED_AUTO_APPLIED))):
+                raise ValueError("seed has already been retired")
 
     @staticmethod
     def _validate_payload_schema(event: CognitiveEvent) -> None:
@@ -585,6 +759,18 @@ class SQLiteEventStore:
                 if keys != required:
                     raise ValueError("seed approval observation must use its fixed schema")
                 SQLiteEventStore._strings(event.payload, required, MAX_SHORT_TEXT)
+            elif event.payload.get("approval") == "seed_standing_policy":
+                required = {"approval", "policy_digest", "nonce"}
+                if keys != required:
+                    raise ValueError("standing seed policy approval observation must use its fixed schema")
+                SQLiteEventStore._sha256(event.payload["policy_digest"])
+                SQLiteEventStore._id(event.payload["nonce"], "nonce")
+            elif event.payload.get("approval") == "seed_standing_policy_revoke":
+                required = {"approval", "policy_id", "policy_event_id"}
+                if keys != required:
+                    raise ValueError("standing seed policy revocation observation must use its fixed schema")
+                SQLiteEventStore._id(event.payload["policy_id"], "policy_id")
+                SQLiteEventStore._id(event.payload["policy_event_id"], "policy_event_id")
             elif event.payload.get("approval") == "self_claim":
                 required = {"approval", "claim_id", "proposal_event_id"}
                 if keys != required:
@@ -726,6 +912,97 @@ class SQLiteEventStore:
             if keys != {"seed_id", "reason"}:
                 raise ValueError("seed retirement must use its fixed schema")
             SQLiteEventStore._strings(event.payload, keys, MAX_SHORT_TEXT)
+        elif event.kind == EventKind.SEED_STANDING_POLICY:
+            required = PAYLOAD_KEYS[EventKind.SEED_STANDING_POLICY]
+            if keys != required:
+                raise ValueError("standing seed policy must use its fixed schema")
+            for key in ("policy_id", "user_observation_event_id", "nonce"):
+                SQLiteEventStore._id(event.payload[key], key)
+            SQLiteEventStore._timestamp(event.payload["issued_at"], "issued_at")
+            SQLiteEventStore._timestamp(event.payload["expires_at"], "expires_at")
+            if parse_aware_iso8601(event.payload["expires_at"]) <= parse_aware_iso8601(event.payload["issued_at"]):
+                raise ValueError("standing seed policy must expire after issuance")
+            SQLiteEventStore._bounded_text(event.payload["scope"], "scope", MAX_SHORT_TEXT)
+            for key, lower, upper in (
+                    ("max_auto_activations", 0, 10000), ("max_auto_updates", 0, 10000),
+                    ("max_active_seeds", 1, 128), ("max_cue_terms", 1, MAX_LIST),
+                    ("max_cue_length", 1, MAX_SHORT_TEXT),
+                    ("max_seed_ttl_seconds", 1, 365 * 24 * 60 * 60),
+                    ("max_counterevidence", 0, 1000000), ("max_seed_versions", 2, 10000)):
+                SQLiteEventStore._integer(event.payload[key], key, lower, upper)
+            for key in ("max_strength", "max_confidence", "max_strength_step", "max_confidence_step"):
+                SQLiteEventStore._number(event.payload[key], key, 0.0, 1.0)
+            SQLiteEventStore._string_list(event.payload["allowed_policy_bias"])
+            if (not event.payload["allowed_policy_bias"]
+                    or len(set(event.payload["allowed_policy_bias"])) != len(event.payload["allowed_policy_bias"])):
+                raise ValueError("allowed_policy_bias must be a non-empty unique bounded list")
+            if event.payload["policy_version"] != "seed_standing_policy_v1":
+                raise ValueError("standing seed policy version is invalid")
+        elif event.kind == EventKind.SEED_STANDING_POLICY_REVOKED:
+            required = PAYLOAD_KEYS[EventKind.SEED_STANDING_POLICY_REVOKED]
+            if keys != required:
+                raise ValueError("standing seed policy revocation must use its fixed schema")
+            for key in ("revocation_id", "policy_id", "policy_event_id"):
+                SQLiteEventStore._id(event.payload[key], key)
+            SQLiteEventStore._bounded_text(event.payload["reason"], "reason", MAX_SHORT_TEXT)
+            SQLiteEventStore._timestamp(event.payload["revoked_at"], "revoked_at")
+            if event.payload["version"] != "seed_standing_policy_revocation_v1":
+                raise ValueError("standing seed policy revocation version is invalid")
+        elif event.kind == EventKind.SEED_UPDATE_PROPOSED:
+            required = PAYLOAD_KEYS[EventKind.SEED_UPDATE_PROPOSED]
+            if keys != required:
+                raise ValueError("seed update proposal must use its fixed schema")
+            for key in ("proposal_id", "seed_id", "base_event_id"):
+                SQLiteEventStore._id(event.payload[key], key)
+            SQLiteEventStore._integer(event.payload["base_version"], "base_version", 1, 10000)
+            if event.payload["operation"] not in SEED_AUTO_UPDATE_OPERATIONS:
+                raise ValueError("seed update operation is invalid")
+            expected_status = "retired" if event.payload["operation"] == "retire" else "active"
+            SQLiteEventStore._seed_snapshot(event.payload["proposed_seed"], frozenset((expected_status,)))
+            if (event.payload["proposed_seed"]["seed_id"] != event.payload["seed_id"]
+                    or event.payload["proposed_seed"]["version"] != event.payload["base_version"] + 1):
+                raise ValueError("seed update proposal must bind the next seed version")
+            SQLiteEventStore._sha256(event.payload["delta_digest"])
+            if event.payload["version"] != "seed_update_proposal_v1":
+                raise ValueError("seed update proposal version is invalid")
+        elif event.kind == EventKind.SEED_AUTO_ELIGIBILITY:
+            required = PAYLOAD_KEYS[EventKind.SEED_AUTO_ELIGIBILITY]
+            if keys != required:
+                raise ValueError("seed auto eligibility must use its fixed schema")
+            for key in ("eligibility_id", "policy_id", "policy_event_id", "proposal_event_id", "seed_id"):
+                SQLiteEventStore._id(event.payload[key], key)
+            if event.payload["base_event_id"] is not None:
+                SQLiteEventStore._id(event.payload["base_event_id"], "base_event_id")
+            SQLiteEventStore._integer(event.payload["base_version"], "base_version", 1, 10000)
+            if event.payload["operation"] not in SEED_AUTO_OPERATIONS:
+                raise ValueError("seed auto eligibility operation is invalid")
+            if event.payload["decision"] not in {"eligible", "rejected"}:
+                raise ValueError("seed auto eligibility decision is invalid")
+            SQLiteEventStore._id(event.payload["reason"], "reason")
+            for key in ("auto_activations_used", "auto_updates_used", "active_seeds"):
+                SQLiteEventStore._integer(event.payload[key], key, 0, 1000000)
+            SQLiteEventStore._timestamp(event.payload["evaluated_at"], "evaluated_at")
+            if event.payload["version"] != "seed_auto_eligibility_v1":
+                raise ValueError("seed auto eligibility version is invalid")
+        elif event.kind == EventKind.SEED_AUTO_APPLIED:
+            required = PAYLOAD_KEYS[EventKind.SEED_AUTO_APPLIED]
+            if keys != required:
+                raise ValueError("seed auto application must use its fixed schema")
+            for key in ("application_id", "eligibility_event_id", "policy_id", "policy_event_id",
+                        "proposal_event_id", "seed_id"):
+                SQLiteEventStore._id(event.payload[key], key)
+            if event.payload["base_event_id"] is not None:
+                SQLiteEventStore._id(event.payload["base_event_id"], "base_event_id")
+            for key in ("base_version", "new_version"):
+                SQLiteEventStore._integer(event.payload[key], key, 1, 10000)
+            if (event.payload["operation"] not in SEED_AUTO_OPERATIONS
+                    or event.payload["new_version"] != event.payload["base_version"] + 1):
+                raise ValueError("seed auto application operation or version is invalid")
+            SQLiteEventStore._sha256(event.payload["prior_seed_digest"])
+            SQLiteEventStore._sha256(event.payload["new_seed_digest"])
+            SQLiteEventStore._timestamp(event.payload["applied_at"], "applied_at")
+            if event.payload["version"] != "seed_auto_application_v1":
+                raise ValueError("seed auto application version is invalid")
         elif event.kind == EventKind.SELF_CLAIM_PROPOSED:
             if keys != {"claim", "state"} or event.payload.get("state") != "candidate":
                 raise ValueError("self-claim proposal must use its fixed candidate schema")
@@ -1262,6 +1539,36 @@ class SQLiteEventStore:
             SQLiteEventStore._timestamp(event.payload["consumed_at"], "consumed_at")
             if event.payload["version"] != "expedition_authorization_consumed_v1":
                 raise ValueError("expedition authorization consumption version is invalid")
+        elif event.kind == EventKind.EXPEDITION_SEED_CONTEXT:
+            required = PAYLOAD_KEYS[EventKind.EXPEDITION_SEED_CONTEXT]
+            if keys != required:
+                raise ValueError("expedition seed context must use its fixed schema")
+            if event.source_ref != "SeedGuidanceProjector":
+                raise ValueError("expedition seed context source_ref is invalid")
+            for key in ("context_id", "run_id"):
+                SQLiteEventStore._id(event.payload[key], key)
+            if event.payload["directive"] != "request_human_review":
+                raise ValueError("expedition seed context directive is invalid")
+            authorities = event.payload["seed_authorities"]
+            if not isinstance(authorities, list) or len(authorities) > 2:
+                raise ValueError("expedition seed context may contain at most two seed authorities")
+            expected_bands = ("primary", "secondary")[:len(authorities)]
+            if tuple(item.get("priority_band") for item in authorities) != expected_bands:
+                raise ValueError("expedition seed context priority bands must be deterministic")
+            for item in authorities:
+                if set(item) != {"seed_id", "authority_event_id", "snapshot_digest", "priority_band"}:
+                    raise ValueError("expedition seed authority must use its fixed public projection")
+                SQLiteEventStore._id(item["seed_id"], "seed_id")
+                SQLiteEventStore._id(item["authority_event_id"], "authority_event_id")
+                SQLiteEventStore._sha256(item["snapshot_digest"])
+            if len({item["seed_id"] for item in authorities}) != len(authorities):
+                raise ValueError("expedition seed context seed IDs must be unique")
+            SQLiteEventStore._sha256(event.payload["context_digest"])
+            SQLiteEventStore._timestamp(event.payload["created_at"], "created_at")
+            if event.payload["created_at"] != event.created_at:
+                raise ValueError("expedition seed context created_at must equal event created_at")
+            if event.payload["version"] != "expedition_seed_context_v1":
+                raise ValueError("expedition seed context version is invalid")
         elif event.kind == EventKind.PROVIDER_USAGE_EVIDENCE:
             legacy_required = {"usage_evidence_id", "provider", "quota_source", "observed_at", "reset_at",
                         "total", "remaining", "evidence_digest", "evidence_version"}
@@ -1493,6 +1800,117 @@ class SQLiteEventStore:
         ordered = [parents[parent_id] for parent_id in event.parent_event_ids]
         payload = event.payload
         prior_events = self.list(event.session_id)
+        records_by_id = {candidate.event_id: candidate for candidate in prior_events}
+
+        def policy_for(application: CognitiveEvent) -> CognitiveEvent:
+            policy = records_by_id.get(application.payload.get("policy_event_id"))
+            if policy is None or policy.kind != EventKind.SEED_STANDING_POLICY:
+                raise ValueError("seed application must name its standing policy")
+            return policy
+
+        def activation_snapshot(candidate: Dict[str, Any], policy: CognitiveEvent,
+                                applied_at: str, version: int) -> Dict[str, Any]:
+            return self.standing_seed_activation_snapshot(
+                candidate, policy.payload, applied_at, version)
+
+        def effective_snapshot(authority: CognitiveEvent) -> Dict[str, Any]:
+            if authority.kind == EventKind.SEED_APPROVED:
+                proposal = records_by_id.get(authority.payload.get("proposal_event_id"))
+                if proposal is None or proposal.kind != EventKind.SEED_PROPOSED:
+                    raise ValueError("seed approval has no reconstructable proposal")
+                active = dict(proposal.payload["seed"])
+                active.update({"status": "active", "version": active["version"] + 1,
+                               "updated_at": authority.created_at})
+                return active
+            if authority.kind == EventKind.SEED_AUTO_APPLIED:
+                proposal = records_by_id.get(authority.payload.get("proposal_event_id"))
+                if proposal is None:
+                    raise ValueError("seed application has no reconstructable proposal")
+                if authority.payload.get("operation") == "activate":
+                    if proposal.kind != EventKind.SEED_PROPOSED:
+                        raise ValueError("seed activation must derive from a candidate")
+                    return activation_snapshot(
+                        proposal.payload["seed"], policy_for(authority),
+                        authority.payload["applied_at"], authority.payload["new_version"])
+                if proposal.kind != EventKind.SEED_UPDATE_PROPOSED:
+                    raise ValueError("seed update must derive from an update proposal")
+                return dict(proposal.payload["proposed_seed"])
+            raise ValueError("seed authority has no effective active snapshot")
+
+        def plain_user_observation(candidate: Optional[CognitiveEvent]) -> bool:
+            return (candidate is not None and candidate.kind == EventKind.OBSERVATION
+                    and candidate.source_kind == SourceKind.USER
+                    and "approval" not in candidate.payload
+                    and set(candidate.payload).issubset({"content", "channel"})
+                    and isinstance(candidate.payload.get("content"), str))
+
+        def user_evidence_matches_cue(evidence: CognitiveEvent,
+                                      prior: Dict[str, Any]) -> bool:
+            if not plain_user_observation(evidence):
+                return False
+            return self.seed_evidence_literal_cue_match(
+                evidence.payload["content"], prior["cue_terms"])
+
+        def bound_user_correction(evidence: CognitiveEvent, base: CognitiveEvent,
+                                  prior: Dict[str, Any]) -> bool:
+            if evidence.kind != EventKind.CORRECTION or evidence.source_kind != SourceKind.USER:
+                return False
+            target = records_by_id.get(evidence.payload.get("target_event_id"))
+            counterevidence = records_by_id.get(
+                evidence.payload.get("counterevidence_event_id"))
+            allowed_targets = {base.event_id} | set(prior["provenance_event_ids"])
+            return (target is not None
+                    and target.event_id in allowed_targets
+                    and plain_user_observation(counterevidence)
+                    and tuple(evidence.parent_event_ids)
+                    == (target.event_id, counterevidence.event_id)
+                    and counterevidence.sequence is not None
+                    and base.sequence is not None
+                    and counterevidence.sequence > base.sequence)
+
+        def server_candidate_provenance(
+                proposal: CognitiveEvent, seed: Dict[str, Any]) -> bool:
+            provenance = seed["provenance_event_ids"]
+            if len(provenance) != 2 or tuple(proposal.parent_event_ids) != tuple(provenance):
+                return False
+            observation = records_by_id.get(provenance[0])
+            decision = records_by_id.get(provenance[1])
+            return (plain_user_observation(observation)
+                    and decision is not None and decision.kind == EventKind.DECISION
+                    and observation.event_id in decision.payload.get("observation_event_ids", ())
+                    and observation.event_id in decision.parent_event_ids)
+
+        def retired_seed_ids() -> set:
+            return {candidate.payload["seed_id"] for candidate in prior_events
+                    if (candidate.kind == EventKind.SEED_RETIRED
+                        or (candidate.kind == EventKind.SEED_AUTO_APPLIED
+                            and candidate.payload.get("operation") == "retire"))}
+
+        def duplicate_seed_identity(proposal: CognitiveEvent,
+                                    seed: Dict[str, Any]) -> bool:
+            identity = self.seed_identity_digest(seed)
+            for candidate in prior_events:
+                if (candidate.kind != EventKind.SEED_PROPOSED
+                        or candidate.event_id == proposal.event_id
+                        or candidate.sequence is None or proposal.sequence is None
+                        or candidate.sequence >= proposal.sequence):
+                    continue
+                if self.seed_identity_digest(candidate.payload["seed"]) == identity:
+                    return True
+            return False
+
+        def policy_counts(policy_event_id: str) -> tuple:
+            applications = [candidate for candidate in prior_events
+                            if candidate.kind == EventKind.SEED_AUTO_APPLIED
+                            and candidate.payload.get("policy_event_id") == policy_event_id]
+            activations = sum(candidate.payload.get("operation") == "activate"
+                              for candidate in applications)
+            updates = len(applications) - activations
+            active = {candidate.payload["seed_id"] for candidate in prior_events
+                      if (candidate.kind == EventKind.SEED_APPROVED
+                          or (candidate.kind == EventKind.SEED_AUTO_APPLIED
+                              and candidate.payload.get("operation") == "activate"))}
+            return activations, updates, len(active - retired_seed_ids())
 
         def prior_matching(kind: EventKind, field: str, value: Any) -> List[CognitiveEvent]:
             return [candidate for candidate in prior_events
@@ -1527,6 +1945,31 @@ class SQLiteEventStore:
             no_sleep_wake_evidence(event.payload["seed"]["provenance_event_ids"], "seed provenance")
             if any(parent.kind in NON_EVIDENCE_LIFECYCLE_EVENT_KINDS | EXPERIMENT_EVENT_KINDS for parent in ordered):
                 raise ValueError("lifecycle or experiment records cannot support seed approval")
+        if event.kind == EventKind.SEED_APPROVED:
+            if (len(ordered) != 2 or ordered[0].kind != EventKind.SEED_PROPOSED
+                    or ordered[1].kind != EventKind.OBSERVATION
+                    or ordered[1].source_kind != SourceKind.USER):
+                raise ValueError("seed approval requires ordered proposal and user approval parents")
+            proposal, approval = ordered
+            if (payload["proposal_event_id"] != proposal.event_id
+                    or payload["approval_event_id"] != approval.event_id
+                    or payload["seed_id"] != proposal.payload["seed"]["seed_id"]
+                    or approval.payload.get("approval") != "seed"
+                    or approval.payload.get("seed_id") != payload["seed_id"]
+                    or approval.payload.get("proposal_event_id") != proposal.event_id):
+                raise ValueError("seed approval must bind its proposal and explicit user approval")
+        if event.kind == EventKind.SEED_RETIRED:
+            if len(ordered) != 1 or ordered[0].kind not in (
+                    EventKind.SEED_PROPOSED, EventKind.SEED_APPROVED, EventKind.SEED_AUTO_APPLIED):
+                raise ValueError("seed retirement requires its current seed authority parent")
+            authority = ordered[0]
+            authority_seed_id = (authority.payload["seed"]["seed_id"]
+                                 if authority.kind == EventKind.SEED_PROPOSED
+                                 else authority.payload["seed_id"])
+            if payload["seed_id"] != authority_seed_id:
+                raise ValueError("seed retirement must bind its seed authority")
+            if authority.kind == EventKind.SEED_AUTO_APPLIED and authority.payload["operation"] == "retire":
+                raise ValueError("retired seed cannot be retired again")
         if event.kind in (EventKind.SELF_CLAIM_PROPOSED, EventKind.SELF_CLAIM_APPROVED):
             claim = payload["claim"]
             mirror_ids = {candidate.event_id for candidate in prior_events
@@ -1534,13 +1977,269 @@ class SQLiteEventStore:
             if mirror_ids.intersection(claim["evidence_event_ids"]):
                 raise ValueError("metacognitive mirrors cannot support self-model approval")
             no_sleep_wake_evidence(claim["evidence_event_ids"], "self-model evidence")
+            records = {candidate.event_id: candidate for candidate in prior_events}
+            if any(records[item].kind in SEED_AUTO_EVENT_KINDS
+                   for item in claim["evidence_event_ids"]):
+                raise ValueError("standing seed policy records cannot support self-model claims")
             if any(parent.kind in NON_EVIDENCE_LIFECYCLE_EVENT_KINDS | EXPERIMENT_EVENT_KINDS for parent in ordered):
                 raise ValueError("lifecycle or experiment records cannot support self-model approval")
+            if any(parent.kind in SEED_AUTO_EVENT_KINDS for parent in ordered):
+                raise ValueError("standing seed policy records cannot parent self-model claims")
 
         if event.kind in (EventKind.SEED_APPROVED, EventKind.SEED_RETIRED,
                           EventKind.SELF_CLAIM_REVOKED):
             if any(parent.kind in NON_EVIDENCE_LIFECYCLE_EVENT_KINDS | EXPERIMENT_EVENT_KINDS for parent in ordered):
                 raise ValueError("lifecycle or experiment records cannot approve or revoke durable records")
+
+        if event.kind == EventKind.SEED_STANDING_POLICY:
+            if (len(ordered) != 1 or ordered[0].kind != EventKind.OBSERVATION
+                    or ordered[0].source_kind != SourceKind.USER):
+                raise ValueError("standing seed policy requires exactly one prior user observation")
+            approval = ordered[0]
+            if (payload["user_observation_event_id"] != approval.event_id
+                    or approval.payload.get("approval") != "seed_standing_policy"
+                    or approval.payload.get("nonce") != payload["nonce"]
+                    or approval.payload.get("policy_digest") != self.standing_seed_policy_digest(payload)):
+                raise ValueError("standing seed policy must bind its explicit user approval")
+            if payload["issued_at"] != event.created_at:
+                raise ValueError("standing seed policy issued_at must equal event created_at")
+            if parse_aware_iso8601(event.created_at) < parse_aware_iso8601(approval.created_at):
+                raise ValueError("standing seed policy cannot predate its user approval")
+
+        if event.kind == EventKind.SEED_STANDING_POLICY_REVOKED:
+            if (len(ordered) != 2 or ordered[0].kind != EventKind.SEED_STANDING_POLICY
+                    or ordered[1].kind != EventKind.OBSERVATION
+                    or ordered[1].source_kind != SourceKind.USER):
+                raise ValueError("standing seed policy revocation requires ordered policy and user observation parents")
+            policy, approval = ordered
+            if (payload["policy_event_id"] != policy.event_id
+                    or payload["policy_id"] != policy.payload["policy_id"]
+                    or approval.payload.get("approval") != "seed_standing_policy_revoke"
+                    or approval.payload.get("policy_event_id") != policy.event_id
+                    or approval.payload.get("policy_id") != policy.payload["policy_id"]):
+                raise ValueError("standing seed policy revocation must bind its policy")
+            if payload["revoked_at"] != event.created_at:
+                raise ValueError("standing seed policy revoked_at must equal event created_at")
+            revoked_at = parse_aware_iso8601(event.created_at)
+            if (revoked_at < parse_aware_iso8601(policy.payload["issued_at"])
+                    or revoked_at < parse_aware_iso8601(approval.created_at)):
+                raise ValueError("standing seed policy revocation cannot predate issuance")
+
+        if event.kind == EventKind.SEED_UPDATE_PROPOSED:
+            if len(ordered) != 2 or ordered[0].event_id != payload["base_event_id"]:
+                raise ValueError("seed update proposal requires exact ordered base and new evidence parents")
+            base, evidence = ordered
+            if base.kind not in (EventKind.SEED_APPROVED, EventKind.SEED_AUTO_APPLIED):
+                raise ValueError("seed update proposal base must be an active seed authority")
+            prior = effective_snapshot(base)
+            proposed = payload["proposed_seed"]
+            if (base.sequence is None or evidence.sequence is None
+                    or evidence.sequence <= base.sequence):
+                raise ValueError("seed update requires new evidence after its current base")
+            if (base.payload.get("seed_id") != payload["seed_id"]
+                    or prior["seed_id"] != payload["seed_id"]
+                    or prior["version"] != payload["base_version"]
+                    or (base.kind == EventKind.SEED_AUTO_APPLIED
+                        and base.payload.get("operation") == "retire")):
+                raise ValueError("seed update proposal base is stale, retired, or mismatched")
+            if payload["seed_id"] in retired_seed_ids():
+                raise ValueError("retired seed cannot be updated")
+            if (proposed["cue_terms"] != prior["cue_terms"]
+                    or proposed["policy_bias"] != prior["policy_bias"]
+                    or proposed["scope"] != prior["scope"]
+                    or proposed["seed_id"] != prior["seed_id"]
+                    or proposed["created_at"] != prior["created_at"]
+                    or proposed["version"] != prior["version"] + 1
+                    or proposed["updated_at"] != event.created_at
+                    or proposed["provenance_event_ids"] != prior["provenance_event_ids"] + [evidence.event_id]):
+                raise ValueError("seed update cannot rewrite identity, history, or version lineage")
+            if proposed["expires_at"] is None:
+                raise ValueError("automatically updated seed requires a finite expiry")
+            proposed_expiry = parse_aware_iso8601(proposed["expires_at"])
+            if proposed_expiry <= parse_aware_iso8601(event.created_at):
+                raise ValueError("seed update expiry must remain after the proposal event")
+            if (prior["expires_at"] is not None
+                    and proposed_expiry > parse_aware_iso8601(prior["expires_at"])):
+                raise ValueError("seed update cannot extend the prior expiry")
+            operation = payload["operation"]
+            if operation == "reinforce":
+                if (not user_evidence_matches_cue(evidence, prior)
+                        or proposed["status"] != "active"
+                        or proposed["strength"] < prior["strength"]
+                        or proposed["confidence"] < prior["confidence"]
+                        or (proposed["strength"] == prior["strength"]
+                            and proposed["confidence"] == prior["confidence"])
+                        or proposed["counterevidence"] != prior["counterevidence"]):
+                    raise ValueError("seed reinforcement requires new user evidence and a monotonic delta")
+            else:
+                if (not bound_user_correction(evidence, base, prior)
+                        or proposed["strength"] > prior["strength"]
+                        or proposed["confidence"] > prior["confidence"]
+                        or proposed["counterevidence"] != prior["counterevidence"] + 1
+                        or proposed["status"] != ("retired" if operation == "retire" else "active")):
+                    raise ValueError("seed tightening or retirement requires bound correction evidence")
+            delta_manifest = {
+                "base_event_id": base.event_id, "base_version": prior["version"],
+                "evidence_event_id": evidence.event_id, "operation": operation,
+                "proposed_seed": proposed, "seed_id": proposed["seed_id"],
+            }
+            expected_delta = hashlib.sha256(
+                canonical_json(delta_manifest).encode("utf-8")).hexdigest()
+            if payload["delta_digest"] != expected_delta:
+                raise ValueError("seed update delta digest does not bind its exact change")
+
+        if event.kind == EventKind.SEED_AUTO_ELIGIBILITY:
+            if (len(ordered) != 2
+                    or ordered[0].kind not in (EventKind.SEED_PROPOSED, EventKind.SEED_UPDATE_PROPOSED)
+                    or ordered[1].kind != EventKind.SEED_STANDING_POLICY):
+                raise ValueError("seed auto eligibility requires ordered proposal and policy parents")
+            proposal, policy = ordered
+            proposed_seed = (proposal.payload["seed"] if proposal.kind == EventKind.SEED_PROPOSED
+                             else proposal.payload["proposed_seed"])
+            expected_operation = "activate" if proposal.kind == EventKind.SEED_PROPOSED else proposal.payload["operation"]
+            expected_base = None if proposal.kind == EventKind.SEED_PROPOSED else proposal.payload["base_event_id"]
+            if (payload["proposal_event_id"] != proposal.event_id
+                    or payload["policy_event_id"] != policy.event_id
+                    or payload["policy_id"] != policy.payload["policy_id"]
+                    or payload["seed_id"] != proposed_seed["seed_id"]
+                    or payload["operation"] != expected_operation
+                    or payload["base_event_id"] != expected_base
+                    or payload["base_version"] != (proposed_seed["version"] if proposal.kind == EventKind.SEED_PROPOSED
+                                                    else proposal.payload["base_version"])):
+                raise ValueError("seed auto eligibility bindings do not match proposal and policy")
+            if payload["evaluated_at"] != event.created_at:
+                raise ValueError("seed eligibility evaluated_at must equal event created_at")
+            if proposal.sequence is None or policy.sequence is None or proposal.sequence <= policy.sequence:
+                raise ValueError("standing seed policy cannot authorize a pre-existing proposal")
+            evaluated = parse_aware_iso8601(event.created_at)
+            issued = parse_aware_iso8601(policy.payload["issued_at"])
+            expires = parse_aware_iso8601(policy.payload["expires_at"])
+            revoked = any(candidate.kind == EventKind.SEED_STANDING_POLICY_REVOKED
+                          and candidate.payload.get("policy_event_id") == policy.event_id
+                          for candidate in prior_events)
+            trusted_now = self._trusted_clock()
+            active_policy = (issued <= evaluated < expires
+                             and trusted_now < expires and not revoked)
+            if payload["decision"] == "eligible":
+                if not active_policy:
+                    raise ValueError("revoked or expired standing seed policy cannot authorize eligibility")
+                activation_count, update_count, active_count = policy_counts(policy.event_id)
+                if (payload["auto_activations_used"] != activation_count
+                        or payload["auto_updates_used"] != update_count
+                        or payload["active_seeds"] != active_count):
+                    raise ValueError("seed auto eligibility counters do not match prior applications")
+                if (payload["operation"] == "activate"
+                        and (payload["auto_activations_used"] >= policy.payload["max_auto_activations"]
+                             or payload["active_seeds"] >= policy.payload["max_active_seeds"])):
+                    raise ValueError("standing seed activation budget is exhausted")
+                if (payload["operation"] != "activate"
+                        and payload["auto_updates_used"] >= policy.payload["max_auto_updates"]):
+                    raise ValueError("standing seed update budget is exhausted")
+                if payload["seed_id"] in retired_seed_ids():
+                    raise ValueError("retired seed cannot be automatically managed")
+                if proposal.kind == EventKind.SEED_PROPOSED:
+                    if not server_candidate_provenance(proposal, proposed_seed):
+                        raise ValueError("seed activation requires exact bound user-observation and decision provenance")
+                    if duplicate_seed_identity(proposal, proposed_seed):
+                        raise ValueError("seed semantic identity has already been proposed or tombstoned")
+                    if (proposed_seed["expires_at"] is not None
+                            and parse_aware_iso8601(proposed_seed["expires_at"]) <= evaluated):
+                        raise ValueError("expired seed candidate cannot be automatically eligible")
+                if (proposed_seed["scope"] != policy.payload["scope"]
+                        or proposed_seed["policy_bias"] not in policy.payload["allowed_policy_bias"]
+                        or len(proposed_seed["cue_terms"]) > policy.payload["max_cue_terms"]
+                        or any(len(term) > policy.payload["max_cue_length"] for term in proposed_seed["cue_terms"])
+                        or proposed_seed["strength"] > policy.payload["max_strength"]
+                        or proposed_seed["confidence"] > policy.payload["max_confidence"]
+                        or (proposed_seed["version"] + (1 if payload["operation"] == "activate" else 0)
+                            > policy.payload["max_seed_versions"])):
+                    raise ValueError("seed auto eligibility exceeds standing policy seed bounds")
+                if proposal.kind == EventKind.SEED_UPDATE_PROPOSED:
+                    base = records_by_id[payload["base_event_id"]]
+                    prior = effective_snapshot(base)
+                    strength_delta = proposed_seed["strength"] - prior["strength"]
+                    confidence_delta = proposed_seed["confidence"] - prior["confidence"]
+                    if (abs(strength_delta) > policy.payload["max_strength_step"]
+                            or abs(confidence_delta) > policy.payload["max_confidence_step"]
+                            or proposed_seed["counterevidence"] > policy.payload["max_counterevidence"]):
+                        raise ValueError("seed update exceeds the standing policy delta bounds")
+                    seed_expiry = parse_aware_iso8601(proposed_seed["expires_at"])
+                    maximum_expiry = min(expires, evaluated + timedelta(
+                        seconds=policy.payload["max_seed_ttl_seconds"]))
+                    if seed_expiry <= evaluated or seed_expiry > maximum_expiry:
+                        raise ValueError("seed update expiry exceeds the standing policy window or TTL")
+
+        if event.kind == EventKind.SEED_AUTO_APPLIED:
+            if (len(ordered) != 3 or ordered[0].kind != EventKind.SEED_AUTO_ELIGIBILITY
+                    or ordered[1].kind not in (EventKind.SEED_PROPOSED, EventKind.SEED_UPDATE_PROPOSED)
+                    or ordered[2].kind != EventKind.SEED_STANDING_POLICY):
+                raise ValueError("seed auto application requires ordered eligibility, proposal, and policy parents")
+            eligibility, proposal, policy = ordered
+            if (payload["eligibility_event_id"] != eligibility.event_id
+                    or payload["proposal_event_id"] != proposal.event_id
+                    or payload["policy_event_id"] != policy.event_id
+                    or payload["policy_id"] != policy.payload["policy_id"]
+                    or payload["seed_id"] != eligibility.payload["seed_id"]
+                    or payload["base_event_id"] != eligibility.payload["base_event_id"]
+                    or payload["base_version"] != eligibility.payload["base_version"]
+                    or payload["operation"] != eligibility.payload["operation"]
+                    or eligibility.payload["decision"] != "eligible"):
+                raise ValueError("seed auto application must bind an eligible policy decision")
+            if payload["applied_at"] != event.created_at:
+                raise ValueError("seed application applied_at must equal event created_at")
+            if proposal.sequence is None or policy.sequence is None or proposal.sequence <= policy.sequence:
+                raise ValueError("standing seed policy cannot apply a pre-existing proposal")
+            applied_at = parse_aware_iso8601(event.created_at)
+            if applied_at < parse_aware_iso8601(eligibility.payload["evaluated_at"]):
+                raise ValueError("seed auto application cannot predate eligibility")
+            if not (parse_aware_iso8601(policy.payload["issued_at"]) <= applied_at
+                    < parse_aware_iso8601(policy.payload["expires_at"])):
+                raise ValueError("seed auto application is outside the policy window")
+            if self._trusted_clock() >= parse_aware_iso8601(policy.payload["expires_at"]):
+                raise ValueError("expired standing seed policy cannot auto-apply at the trusted host time")
+            if any(candidate.kind == EventKind.SEED_STANDING_POLICY_REVOKED
+                   and candidate.payload.get("policy_event_id") == policy.event_id
+                   for candidate in prior_events):
+                raise ValueError("revoked standing seed policy cannot auto-apply")
+            activation_count, update_count, active_count = policy_counts(policy.event_id)
+            if (eligibility.payload["auto_activations_used"] != activation_count
+                    or eligibility.payload["auto_updates_used"] != update_count
+                    or eligibility.payload["active_seeds"] != active_count):
+                raise ValueError("seed auto application eligibility counters are stale")
+            if (payload["operation"] == "activate"
+                    and (activation_count >= policy.payload["max_auto_activations"]
+                         or active_count >= policy.payload["max_active_seeds"])):
+                raise ValueError("standing seed activation budget is exhausted at apply")
+            if (payload["operation"] != "activate"
+                    and update_count >= policy.payload["max_auto_updates"]):
+                raise ValueError("standing seed update budget is exhausted at apply")
+            proposed_seed = (proposal.payload["seed"] if proposal.kind == EventKind.SEED_PROPOSED
+                             else proposal.payload["proposed_seed"])
+            if payload["operation"] == "activate":
+                if (payload["seed_id"] in retired_seed_ids()
+                        or duplicate_seed_identity(proposal, proposed_seed)
+                        or not server_candidate_provenance(proposal, proposed_seed)):
+                    raise ValueError("seed activation is stale, duplicated, tombstoned, or untrusted")
+                activated = activation_snapshot(
+                    proposed_seed, policy, event.created_at, payload["new_version"])
+                if (payload["new_version"] != proposed_seed["version"] + 1
+                        or parse_aware_iso8601(activated["expires_at"]) <= applied_at
+                        or payload["prior_seed_digest"] != self.seed_snapshot_digest(proposed_seed)
+                        or payload["new_seed_digest"] != self.seed_snapshot_digest(activated)):
+                    raise ValueError("seed activation digests must bind the exact derived active snapshot")
+            else:
+                if proposal.kind != EventKind.SEED_UPDATE_PROPOSED:
+                    raise ValueError("seed update application requires an update proposal")
+                base = records_by_id.get(payload["base_event_id"])
+                if base is None or payload["seed_id"] in retired_seed_ids():
+                    raise ValueError("seed update base is unavailable or tombstoned")
+                prior = effective_snapshot(base)
+                if (payload["base_version"] != prior["version"]
+                        or payload["new_version"] != proposed_seed["version"]
+                        or parse_aware_iso8601(proposed_seed["expires_at"]) <= applied_at
+                        or payload["prior_seed_digest"] != self.seed_snapshot_digest(prior)
+                        or payload["new_seed_digest"] != self.seed_snapshot_digest(proposed_seed)):
+                    raise ValueError("seed update digests, version, or expiry do not match exact snapshots")
 
         if event.kind == EventKind.MODEL_INVOCATION:
             trigger_kinds = {EventKind.OBSERVATION, EventKind.MEDIA_OBSERVATION,
@@ -1872,6 +2571,60 @@ class SQLiteEventStore:
                     or parse_aware_iso8601(payload["consumed_at"]) < parse_aware_iso8601(authorization.payload["issued_at"])
                     or parse_aware_iso8601(payload["consumed_at"]) >= parse_aware_iso8601(authorization.payload["expires_at"])):
                 raise ValueError("expedition consumption must occur in its exact authorization window")
+        elif event.kind == EventKind.EXPEDITION_SEED_CONTEXT:
+            if not ordered or ordered[0].kind != EventKind.EXPEDITION_AUTHORIZATION_CONSUMED:
+                raise ValueError("expedition seed context requires a consumed authorization first")
+            consumed = ordered[0]
+            authorization = records_by_id.get(consumed.parent_event_ids[0])
+            if authorization is None or authorization.kind != EventKind.EXPEDITION_AUTHORIZATION:
+                raise ValueError("expedition seed context authorization lineage is unavailable")
+            if payload["run_id"] != consumed.payload["run_id"]:
+                raise ValueError("expedition seed context must bind the consumed authorization run")
+            context_at = parse_aware_iso8601(event.created_at)
+            if (context_at < parse_aware_iso8601(consumed.payload["consumed_at"])
+                    or context_at >= parse_aware_iso8601(authorization.payload["expires_at"])):
+                raise ValueError("expedition seed context is outside its authorization window")
+
+            current_authorities = {}
+            retired = set()
+            for candidate in prior_events:
+                if candidate.kind == EventKind.SEED_RETIRED:
+                    retired.add(candidate.payload["seed_id"])
+                    current_authorities.pop(candidate.payload["seed_id"], None)
+                elif candidate.kind == EventKind.SEED_AUTO_APPLIED:
+                    seed_id = candidate.payload["seed_id"]
+                    if candidate.payload.get("operation") == "retire":
+                        retired.add(seed_id)
+                        current_authorities.pop(seed_id, None)
+                    elif seed_id not in retired:
+                        current_authorities[seed_id] = candidate
+                elif candidate.kind == EventKind.SEED_APPROVED:
+                    seed_id = candidate.payload["seed_id"]
+                    if seed_id not in retired:
+                        current_authorities[seed_id] = candidate
+
+            authority_items = payload["seed_authorities"]
+            if tuple(event.parent_event_ids) != ((consumed.event_id,)
+                                                + tuple(item["authority_event_id"]
+                                                        for item in authority_items)):
+                raise ValueError("expedition seed context parents must bind consumed authorization then authorities")
+            if len(ordered) != 1 + len(authority_items):
+                raise ValueError("expedition seed context parent count does not match authorities")
+            for item, authority in zip(authority_items, ordered[1:]):
+                if (authority.event_id != item["authority_event_id"]
+                        or authority.kind not in (EventKind.SEED_APPROVED, EventKind.SEED_AUTO_APPLIED)
+                        or authority.payload.get("seed_id") != item["seed_id"]
+                        or current_authorities.get(item["seed_id"]) is None
+                        or current_authorities[item["seed_id"]].event_id != authority.event_id):
+                    raise ValueError("expedition seed context must name current active seed authorities")
+                snapshot = effective_snapshot(authority)
+                if (snapshot.get("status") != "active"
+                        or snapshot.get("expires_at") is None
+                        or parse_aware_iso8601(snapshot["expires_at"]) <= context_at
+                        or item["snapshot_digest"] != self.seed_snapshot_digest(snapshot)):
+                    raise ValueError("expedition seed context authority is expired or snapshot-mismatched")
+            if payload["context_digest"] != self.expedition_seed_context_digest(payload):
+                raise ValueError("expedition seed context digest does not match its public manifest")
         elif event.kind == EventKind.SLEEP_ENTERED:
             if event.source_ref != "SleepWakeCoordinator" or len(ordered) not in (1, 2, 3):
                 raise ValueError("sleep entered requires archive and optional user policy parents")
@@ -2070,8 +2823,10 @@ class SQLiteEventStore:
             if not math.isclose(payload["updated_value"], expected_updated, rel_tol=0.0, abs_tol=1e-12):
                 raise ValueError("RPE updated_value must equal prior_value + alpha * clipped_delta")
         elif event.kind == EventKind.FRONTIER_RANKING_DECISION:
-            if len(ordered) != 1 or ordered[0].kind != EventKind.EXPEDITION_AUTHORIZATION_CONSUMED:
-                raise ValueError("frontier ranking requires exactly one consumed expedition authorization parent")
+            if (not ordered or ordered[0].kind != EventKind.EXPEDITION_AUTHORIZATION_CONSUMED
+                    or len(ordered) not in {1, 2}
+                    or (len(ordered) == 2 and ordered[1].kind != EventKind.EXPEDITION_SEED_CONTEXT)):
+                raise ValueError("frontier ranking requires consumed authorization and optional current seed context")
             consumed = ordered[0]
             authorization = next((candidate for candidate in prior_events
                                   if candidate.event_id == consumed.parent_event_ids[0]), None)
@@ -2080,6 +2835,11 @@ class SQLiteEventStore:
                     or authorization.payload.get("learning_mode") != "active"
                     or authorization.payload.get("learner_spec_digest") != payload["learner_spec_digest"]):
                 raise ValueError("frontier ranking requires an active v2 or v3 authorization bound to its learner spec")
+            if len(ordered) == 2:
+                context = ordered[1]
+                if (context.parent_event_ids[0] != consumed.event_id
+                        or context.payload.get("run_id") != consumed.payload.get("run_id")):
+                    raise ValueError("frontier ranking seed context must bind its consumed authorization")
         elif event.kind == EventKind.FRONTIER_VECTOR_VALUE_ESTIMATE:
             if len(ordered) != 1 or ordered[0].kind != EventKind.FRONTIER_RANKING_DECISION:
                 raise ValueError("frontier value estimate requires one ranking decision parent")
@@ -2263,14 +3023,96 @@ class SQLiteEventStore:
 
     @staticmethod
     def _seed(seed: Any) -> None:
+        SQLiteEventStore._seed_snapshot(seed, frozenset(("candidate",)))
+
+    @staticmethod
+    def _seed_snapshot(seed: Any, statuses: frozenset) -> None:
         required = {"cue_terms", "policy_bias", "scope", "provenance_event_ids", "strength", "confidence", "status", "seed_id", "created_at", "updated_at", "expires_at", "version", "counterevidence"}
-        if not isinstance(seed, dict) or set(seed) != required or seed.get("status") != "candidate":
+        if not isinstance(seed, dict) or set(seed) != required or seed.get("status") not in statuses:
             raise ValueError("seed must use the bounded candidate schema")
         SQLiteEventStore._strings(seed, {"policy_bias", "scope", "seed_id", "created_at", "updated_at"}, MAX_SHORT_TEXT)
-        SQLiteEventStore._string_list(seed["cue_terms"]); SQLiteEventStore._string_list(seed["provenance_event_ids"])
-        if seed["expires_at"] is not None and (not isinstance(seed["expires_at"], str) or len(seed["expires_at"]) > MAX_SHORT_TEXT): raise ValueError("invalid seed expiry")
-        if (not all(isinstance(seed[key], (int, float)) and not isinstance(seed[key], bool) for key in ("strength", "confidence"))
-                or not all(isinstance(seed[key], int) and not isinstance(seed[key], bool) for key in ("version", "counterevidence"))): raise ValueError("invalid seed numeric fields")
+        SQLiteEventStore._string_list(seed["cue_terms"])
+        SQLiteEventStore._string_list(seed["provenance_event_ids"])
+        if not seed["cue_terms"] or len(set(seed["cue_terms"])) != len(seed["cue_terms"]):
+            raise ValueError("seed cue terms must be non-empty and unique")
+        if seed["expires_at"] is not None:
+            SQLiteEventStore._timestamp(seed["expires_at"], "seed expires_at")
+        SQLiteEventStore._timestamp(seed["created_at"], "seed created_at")
+        SQLiteEventStore._timestamp(seed["updated_at"], "seed updated_at")
+        SQLiteEventStore._number(seed["strength"], "seed strength", 0.0, 1.0)
+        SQLiteEventStore._number(seed["confidence"], "seed confidence", 0.0, 1.0)
+        SQLiteEventStore._integer(seed["version"], "seed version", 1, 10000)
+        SQLiteEventStore._integer(seed["counterevidence"], "seed counterevidence", 0, 1000000)
+
+    @staticmethod
+    def standing_seed_policy_digest(payload: Dict[str, Any]) -> str:
+        """Digest the complete pre-generated standing-policy envelope."""
+        expected = PAYLOAD_KEYS[EventKind.SEED_STANDING_POLICY]
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise ValueError("standing seed policy digest requires the fixed v1 schema")
+        return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def expedition_seed_context_digest(payload: Dict[str, Any]) -> str:
+        """Digest the complete redacted expedition seed-context envelope."""
+        expected = PAYLOAD_KEYS[EventKind.EXPEDITION_SEED_CONTEXT]
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise ValueError("expedition seed context digest requires the fixed v1 schema")
+        material = dict(payload)
+        material.pop("context_digest")
+        return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def seed_snapshot_digest(seed: Dict[str, Any]) -> str:
+        """Return a canonical digest for a bounded public seed snapshot."""
+        SQLiteEventStore._seed_snapshot(seed, frozenset(("candidate", "active", "retired")))
+        return hashlib.sha256(canonical_json(seed).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def standing_seed_activation_snapshot(candidate: Dict[str, Any],
+                                          policy: Dict[str, Any],
+                                          applied_at: str,
+                                          version: int) -> Dict[str, Any]:
+        """Derive the sole bounded active snapshot for a candidate."""
+        SQLiteEventStore._seed_snapshot(candidate, frozenset(("candidate",)))
+        applied_time = parse_aware_iso8601(applied_at)
+        expiry_candidates = [
+            parse_aware_iso8601(policy["expires_at"]),
+            applied_time + timedelta(seconds=policy["max_seed_ttl_seconds"]),
+        ]
+        if candidate["expires_at"] is not None:
+            expiry_candidates.append(parse_aware_iso8601(candidate["expires_at"]))
+        active = dict(candidate)
+        active.update({"status": "active", "version": version,
+                       "updated_at": applied_at,
+                       "expires_at": min(expiry_candidates).isoformat()})
+        SQLiteEventStore._seed_snapshot(active, frozenset(("active",)))
+        return active
+
+    @staticmethod
+    def seed_evidence_literal_cue_match(content: str, cue_terms: List[str]) -> bool:
+        """Deterministically match normalized literal cues; no model judgment."""
+        if not isinstance(content, str) or not isinstance(cue_terms, list):
+            return False
+        normalize = lambda value: " ".join(
+            unicodedata.normalize("NFKC", value).casefold().split())
+        normalized_content = normalize(content)
+        return any(isinstance(cue, str) and normalize(cue)
+                   and normalize(cue) in normalized_content for cue in cue_terms)
+
+    @staticmethod
+    def seed_identity_digest(seed: Dict[str, Any]) -> str:
+        """Canonical public identity shared with the seed projection."""
+        SQLiteEventStore._seed_snapshot(
+            seed, frozenset(("candidate", "active", "retired")))
+        normalize = lambda value: " ".join(
+            unicodedata.normalize("NFKC", value).casefold().split())
+        manifest = {
+            "cue_terms": sorted(set(normalize(item) for item in seed["cue_terms"])),
+            "policy_bias": normalize(seed["policy_bias"]),
+            "scope": normalize(seed["scope"]),
+        }
+        return hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest()
 
     @staticmethod
     def _claim(claim: Any) -> None:

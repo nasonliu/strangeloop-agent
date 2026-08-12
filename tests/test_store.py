@@ -1,4 +1,5 @@
 import os
+import hashlib
 import tempfile
 import threading
 import unittest
@@ -7,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from strangeloop.contracts import (CognitiveEvent, EventKind, SourceKind,
                                    FRONTIER_STRATEGY_ARM_VERSION,
                                    frontier_strategy_arm_id)
-from strangeloop.store import (FRONTIER_CHANNEL_ORDER, SQLiteEventStore,
+from strangeloop.store import (FRONTIER_CHANNEL_ORDER, SQLiteEventStore, canonical_json,
                                frontier_experiment_reward_vector)
 
 
@@ -1470,3 +1471,359 @@ class SQLiteEventStoreTests(unittest.TestCase):
                 source_kind=SourceKind.MODEL, source_ref="model",
                 payload={"claim": claim, "state": "candidate"},
                 parent_event_ids=(target.event_id,)))
+
+    def test_standing_seed_policy_requires_digest_bound_user_approval(self):
+        session = "standing_seed_policy"
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        payload = {
+            "policy_id": "seed_policy_1", "user_observation_event_id": "placeholder",
+            "nonce": "seed_policy_nonce_1", "issued_at": (now + timedelta(seconds=1)).isoformat(),
+            "expires_at": (now + timedelta(hours=1)).isoformat(), "scope": "research",
+            "max_auto_activations": 2, "max_auto_updates": 4, "max_active_seeds": 2,
+            "max_cue_terms": 4, "max_cue_length": 64, "max_strength": .8,
+            "max_confidence": .9, "max_seed_ttl_seconds": 3600,
+            "max_strength_step": .1, "max_confidence_step": .1,
+            "max_counterevidence": 10, "max_seed_versions": 8,
+            "allowed_policy_bias": ["cite_sources"],
+            "policy_version": "seed_standing_policy_v1",
+        }
+        # The approval event ID is part of the signed policy manifest.  Freeze
+        # it before computing the digest so the policy can bind it exactly.
+        approval_id = "evt_seed_policy_approval"
+        payload["user_observation_event_id"] = approval_id
+        approval = self.store.append(CognitiveEvent(
+            event_id=approval_id, session_id=session, kind=EventKind.OBSERVATION,
+            source_kind=SourceKind.USER, source_ref="user", created_at=now.isoformat(),
+            payload={"approval": "seed_standing_policy",
+                     "policy_digest": SQLiteEventStore.standing_seed_policy_digest(payload),
+                     "nonce": payload["nonce"]}))
+        policy = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.SEED_STANDING_POLICY,
+            source_kind=SourceKind.USER, source_ref="user", payload=payload,
+            created_at=payload["issued_at"], parent_event_ids=(approval.event_id,)))
+        self.assertEqual("seed_policy_1", policy.payload["policy_id"])
+        self.assertTrue(self.store.verify_chain(session))
+
+        wrong = dict(payload, policy_id="seed_policy_2", nonce="seed_policy_nonce_2")
+        root = self.store.append(self.event("standing_bad", {"content": "plain request"}))
+        with self.assertRaisesRegex(ValueError, "explicit user approval"):
+            self.store.append(CognitiveEvent(
+                session_id="standing_bad", kind=EventKind.SEED_STANDING_POLICY,
+                source_kind=SourceKind.USER, source_ref="user", payload=wrong,
+                parent_event_ids=(root.event_id,)))
+
+    def test_nested_store_transaction_uses_savepoint_without_partial_commit(self):
+        with self.store.transaction():
+            outer = self.store.append(self.event("nested", {"content": "outer"}), commit=False)
+            with self.assertRaisesRegex(RuntimeError, "abort inner"):
+                with self.store.transaction():
+                    inner = self.store.append(CognitiveEvent(
+                        session_id="nested", kind=EventKind.OBSERVATION,
+                        source_kind=SourceKind.USER, source_ref="test",
+                        payload={"content": "inner"}), commit=False)
+                    raise RuntimeError("abort inner")
+            self.assertIsNone(self.store.get(inner.event_id))
+            self.assertIsNotNone(self.store.get(outer.event_id))
+        self.assertTrue(self.store.verify_chain("nested"))
+
+    def test_standing_seed_activation_keeps_shorter_candidate_expiry(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        candidate = {
+            "cue_terms": ["citation"], "policy_bias": "cite_sources",
+            "scope": "research", "provenance_event_ids": ["evidence_1"],
+            "strength": .25, "confidence": .25, "status": "candidate",
+            "seed_id": "seed_short_ttl", "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            "version": 1, "counterevidence": 0,
+        }
+        policy = {"expires_at": (now + timedelta(hours=2)).isoformat(),
+                  "max_seed_ttl_seconds": 3600}
+        active = SQLiteEventStore.standing_seed_activation_snapshot(
+            candidate, policy, now.isoformat(), 2)
+        self.assertEqual(candidate["expires_at"], active["expires_at"])
+        without_expiry = dict(candidate, expires_at=None, seed_id="seed_no_ttl")
+        derived = SQLiteEventStore.standing_seed_activation_snapshot(
+            without_expiry, policy, now.isoformat(), 2)
+        self.assertEqual((now + timedelta(hours=1)).isoformat(), derived["expires_at"])
+
+    def test_seed_evidence_literal_cue_match_is_deterministic(self):
+        self.assertTrue(SQLiteEventStore.seed_evidence_literal_cue_match(
+            "Please add CITATION checks", ["citation"]))
+        self.assertTrue(SQLiteEventStore.seed_evidence_literal_cue_match(
+            "请加入引用检查", ["引用"]))
+        self.assertFalse(SQLiteEventStore.seed_evidence_literal_cue_match(
+            "unrelated preference", ["citation"]))
+
+    def test_seed_update_rejects_unrelated_reinforcement_and_unbound_correction(self):
+        session = "standing_seed_evidence_binding"
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        evidence = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.OBSERVATION,
+            source_kind=SourceKind.USER, source_ref="user",
+            created_at=now.isoformat(), payload={"content": "citation requested"}))
+        seed = {"cue_terms": ["citation"], "policy_bias": "cite_sources",
+                "scope": "research", "provenance_event_ids": [evidence.event_id],
+                "strength": .25, "confidence": .25, "status": "candidate",
+                "seed_id": "seed_evidence_bound", "created_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+                "expires_at": (now + timedelta(hours=1)).isoformat(),
+                "version": 1, "counterevidence": 0}
+        proposal = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.SEED_PROPOSED,
+            source_kind=SourceKind.MODEL, source_ref="model",
+            created_at=(now + timedelta(seconds=1)).isoformat(),
+            payload={"seed": seed}, parent_event_ids=(evidence.event_id,)))
+        approval = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.OBSERVATION,
+            source_kind=SourceKind.USER, source_ref="user",
+            created_at=(now + timedelta(seconds=2)).isoformat(),
+            payload={"approval": "seed", "seed_id": seed["seed_id"],
+                     "proposal_event_id": proposal.event_id}))
+        active_event = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.SEED_APPROVED,
+            source_kind=SourceKind.USER, source_ref="user",
+            created_at=(now + timedelta(seconds=3)).isoformat(),
+            payload={"seed_id": seed["seed_id"], "proposal_event_id": proposal.event_id,
+                     "approval_event_id": approval.event_id},
+            parent_event_ids=(proposal.event_id, approval.event_id)))
+        prior = dict(seed, status="active", version=2,
+                     updated_at=active_event.created_at)
+
+        unrelated = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.OBSERVATION,
+            source_kind=SourceKind.USER, source_ref="user",
+            created_at=(now + timedelta(seconds=4)).isoformat(),
+            payload={"content": "weather preference"}))
+        reinforced = dict(prior, strength=.3, version=3,
+                          updated_at=(now + timedelta(seconds=5)).isoformat(),
+                          provenance_event_ids=prior["provenance_event_ids"] + [unrelated.event_id])
+        manifest = {"base_event_id": active_event.event_id, "base_version": 2,
+                    "evidence_event_id": unrelated.event_id, "operation": "reinforce",
+                    "proposed_seed": reinforced, "seed_id": seed["seed_id"]}
+        with self.assertRaisesRegex(ValueError, "user evidence.*monotonic delta"):
+            self.store.append(CognitiveEvent(
+                session_id=session, kind=EventKind.SEED_UPDATE_PROPOSED,
+                source_kind=SourceKind.MODEL, source_ref="model",
+                created_at=reinforced["updated_at"],
+                payload={"proposal_id": "update_unrelated", "seed_id": seed["seed_id"],
+                         "base_event_id": active_event.event_id, "base_version": 2,
+                         "operation": "reinforce", "proposed_seed": reinforced,
+                         "delta_digest": hashlib.sha256(
+                             canonical_json(manifest).encode("utf-8")).hexdigest(),
+                         "version": "seed_update_proposal_v1"},
+                parent_event_ids=(active_event.event_id, unrelated.event_id)))
+
+        counterevidence = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.OBSERVATION,
+            source_kind=SourceKind.USER, source_ref="user",
+            created_at=(now + timedelta(seconds=5)).isoformat(),
+            payload={"content": "citation conflict"}))
+        correction = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.CORRECTION,
+            source_kind=SourceKind.USER, source_ref="user",
+            created_at=(now + timedelta(seconds=6)).isoformat(),
+            payload={"target_event_id": unrelated.event_id,
+                     "counterevidence_event_id": counterevidence.event_id,
+                     "disposition": "review_required",
+                     "public_summary": "A later observable record conflicts with an earlier record."},
+            parent_event_ids=(unrelated.event_id, counterevidence.event_id)))
+        tightened = dict(prior, strength=.2, confidence=.2, counterevidence=1,
+                         version=3, updated_at=(now + timedelta(seconds=7)).isoformat(),
+                         provenance_event_ids=prior["provenance_event_ids"] + [correction.event_id])
+        tighten_manifest = {"base_event_id": active_event.event_id, "base_version": 2,
+            "evidence_event_id": correction.event_id, "operation": "tighten",
+            "proposed_seed": tightened, "seed_id": seed["seed_id"]}
+        with self.assertRaisesRegex(ValueError, "bound correction evidence"):
+            self.store.append(CognitiveEvent(
+                session_id=session, kind=EventKind.SEED_UPDATE_PROPOSED,
+                source_kind=SourceKind.MODEL, source_ref="model",
+                created_at=tightened["updated_at"],
+                payload={"proposal_id": "update_unbound_correction",
+                         "seed_id": seed["seed_id"],
+                         "base_event_id": active_event.event_id, "base_version": 2,
+                         "operation": "tighten", "proposed_seed": tightened,
+                         "delta_digest": hashlib.sha256(
+                             canonical_json(tighten_manifest).encode("utf-8")).hexdigest(),
+                         "version": "seed_update_proposal_v1"},
+                parent_event_ids=(active_event.event_id, correction.event_id)))
+
+    def test_standing_seed_auto_activation_is_policy_only_and_parent_bound(self):
+        session = "standing_seed_apply"
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        self.store._trusted_clock = lambda: now + timedelta(seconds=3)
+        policy_payload = {"policy_id": "seed_policy_apply", "user_observation_event_id": "evt_policy_apply_approval",
+            "nonce": "seed_policy_apply_nonce", "issued_at": (now + timedelta(seconds=1)).isoformat(),
+            "expires_at": (now + timedelta(hours=1)).isoformat(), "scope": "research",
+            "max_auto_activations": 1, "max_auto_updates": 2, "max_active_seeds": 2,
+            "max_cue_terms": 4, "max_cue_length": 64, "max_strength": .8,
+            "max_confidence": .9, "max_seed_ttl_seconds": 3600, "max_strength_step": .1,
+            "max_confidence_step": .1, "max_counterevidence": 10, "max_seed_versions": 8,
+            "allowed_policy_bias": ["cite_sources"], "policy_version": "seed_standing_policy_v1"}
+        approval = self.store.append(CognitiveEvent(
+            event_id="evt_policy_apply_approval", session_id=session, kind=EventKind.OBSERVATION,
+            source_kind=SourceKind.USER, source_ref="user", created_at=now.isoformat(),
+            payload={"approval": "seed_standing_policy",
+                     "policy_digest": SQLiteEventStore.standing_seed_policy_digest(policy_payload),
+                     "nonce": policy_payload["nonce"]}))
+        policy = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.SEED_STANDING_POLICY,
+            source_kind=SourceKind.USER, source_ref="user", created_at=policy_payload["issued_at"],
+            payload=policy_payload, parent_event_ids=(approval.event_id,)))
+        evidence = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.OBSERVATION, source_kind=SourceKind.USER,
+            source_ref="user", created_at=(now + timedelta(seconds=1)).isoformat(),
+            payload={"content": "prefer citations"}))
+        action = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.ACTION_PROPOSED, source_kind=SourceKind.MODEL,
+            source_ref="model", created_at=(now + timedelta(seconds=1)).isoformat(),
+            payload={"action_type": "response", "required_capability": None,
+                     "is_mutating": False,
+                     "public_summary": "Action proposal recorded for policy review."},
+            parent_event_ids=(evidence.event_id,)))
+        decision_payload = {"turn_id": "standing_turn", "observation_event_ids": [evidence.event_id],
+            "retrieved_seed_ids": [], "self_claim_ids": [], "policy_reasons": ["bounded"],
+            "selected_action": {"action_type": "response", "required_capability": None,
+                "is_mutating": False, "public_summary": "Action proposal recorded for policy review."},
+            "public_summary": "Policy decision recorded for this turn."}
+        decision = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.DECISION, source_kind=SourceKind.POLICY,
+            source_ref="policy", created_at=(now + timedelta(seconds=1)).isoformat(),
+            payload=decision_payload, parent_event_ids=(evidence.event_id, action.event_id)))
+        seed = {"cue_terms": ["citation"], "policy_bias": "cite_sources", "scope": "research",
+                "provenance_event_ids": [evidence.event_id, decision.event_id],
+                "strength": .5, "confidence": .6, "status": "candidate",
+                "seed_id": "seed_auto_1", "created_at": (now + timedelta(seconds=1)).isoformat(),
+                "updated_at": (now + timedelta(seconds=1)).isoformat(), "expires_at": None,
+                "version": 1, "counterevidence": 0}
+        proposal = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.SEED_PROPOSED, source_kind=SourceKind.MODEL,
+            source_ref="model", payload={"seed": seed},
+            created_at=(now + timedelta(seconds=1)).isoformat(),
+            parent_event_ids=(evidence.event_id, decision.event_id)))
+        eligibility_payload = {"eligibility_id": "eligibility_1", "policy_id": policy.payload["policy_id"],
+            "policy_event_id": policy.event_id, "proposal_event_id": proposal.event_id,
+            "seed_id": seed["seed_id"], "base_event_id": None, "base_version": 1,
+            "operation": "activate", "decision": "eligible", "reason": "within_policy",
+            "auto_activations_used": 0, "auto_updates_used": 0, "active_seeds": 0,
+            "evaluated_at": (now + timedelta(seconds=2)).isoformat(),
+            "version": "seed_auto_eligibility_v1"}
+        eligibility = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.SEED_AUTO_ELIGIBILITY,
+            source_kind=SourceKind.POLICY, source_ref="StandingSeedPolicy",
+            payload=eligibility_payload, parent_event_ids=(proposal.event_id, policy.event_id),
+            created_at=eligibility_payload["evaluated_at"]))
+        activated_seed = dict(seed, status="active", version=2,
+                              updated_at=(now + timedelta(seconds=3)).isoformat(),
+                              expires_at=(now + timedelta(hours=1)).isoformat())
+        application_payload = {"application_id": "application_1", "eligibility_event_id": eligibility.event_id,
+            "policy_id": policy.payload["policy_id"], "policy_event_id": policy.event_id,
+            "proposal_event_id": proposal.event_id, "seed_id": seed["seed_id"],
+            "base_event_id": None, "base_version": 1, "new_version": 2,
+            "operation": "activate", "prior_seed_digest": SQLiteEventStore.seed_snapshot_digest(seed),
+            "new_seed_digest": SQLiteEventStore.seed_snapshot_digest(activated_seed),
+            "applied_at": activated_seed["updated_at"],
+            "version": "seed_auto_application_v1"}
+        applied = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.SEED_AUTO_APPLIED,
+            source_kind=SourceKind.POLICY, source_ref="StandingSeedPolicy",
+            payload=application_payload,
+            parent_event_ids=(eligibility.event_id, proposal.event_id, policy.event_id),
+            created_at=application_payload["applied_at"]))
+        self.assertEqual("activate", applied.payload["operation"])
+        self.assertTrue(self.store.verify_chain(session))
+
+        expedition_approval = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.OBSERVATION,
+            source_kind=SourceKind.USER, source_ref="user",
+            created_at=(now + timedelta(seconds=4)).isoformat(),
+            payload={"content": "run bounded expedition"}))
+        authorization_at = now + timedelta(seconds=5)
+        authorization = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.EXPEDITION_AUTHORIZATION,
+            source_kind=SourceKind.USER, source_ref="user",
+            created_at=authorization_at.isoformat(),
+            payload={"authorization_id": "guidance_authorization",
+                     "approval_event_id": expedition_approval.event_id,
+                     "nonce": "guidance_nonce", "issued_at": authorization_at.isoformat(),
+                     "expires_at": (authorization_at + timedelta(minutes=5)).isoformat(),
+                     "goal_digest": "a" * 64, "host_seed_digest": "b" * 64,
+                     "max_calls_per_slice": 1, "slice_seconds": 10,
+                     "authorization_seconds": 300, "profile": "public_web_only_v1",
+                     "version": "expedition_authorization_v1"},
+            parent_event_ids=(expedition_approval.event_id,)))
+        consumption_at = now + timedelta(seconds=6)
+        consumed = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.EXPEDITION_AUTHORIZATION_CONSUMED,
+            source_kind=SourceKind.SYSTEM, source_ref="ExpeditionScheduler",
+            created_at=consumption_at.isoformat(),
+            payload={"consumption_id": "guidance_consumption",
+                     "authorization_id": "guidance_authorization",
+                     "consumed_at": consumption_at.isoformat(), "run_id": "guidance_run",
+                     "version": "expedition_authorization_consumed_v1"},
+            parent_event_ids=(authorization.event_id,)))
+        guidance_at = now + timedelta(seconds=7)
+        context_payload = {
+            "context_id": "guidance_context", "run_id": "guidance_run",
+            "directive": "request_human_review",
+            "seed_authorities": [{"seed_id": seed["seed_id"],
+                                   "authority_event_id": applied.event_id,
+                                   "snapshot_digest": SQLiteEventStore.seed_snapshot_digest(activated_seed),
+                                   "priority_band": "primary"}],
+            "context_digest": "0" * 64, "created_at": guidance_at.isoformat(),
+            "version": "expedition_seed_context_v1",
+        }
+        context_payload["context_digest"] = SQLiteEventStore.expedition_seed_context_digest(context_payload)
+        context = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.EXPEDITION_SEED_CONTEXT,
+            source_kind=SourceKind.POLICY, source_ref="SeedGuidanceProjector",
+            created_at=guidance_at.isoformat(), payload=context_payload,
+            parent_event_ids=(consumed.event_id, applied.event_id)))
+        self.assertEqual(EventKind.EXPEDITION_SEED_CONTEXT, context.kind)
+        self.assertTrue(self.store.verify_chain(session))
+
+        with self.assertRaisesRegex(ValueError, "event source is not allowed"):
+            self.store.append(CognitiveEvent(
+                session_id=session, kind=EventKind.EXPEDITION_SEED_CONTEXT,
+                source_kind=SourceKind.MODEL, source_ref="model",
+                created_at=(now + timedelta(seconds=8)).isoformat(), payload=dict(
+                    context_payload, context_id="model_context",
+                    created_at=(now + timedelta(seconds=8)).isoformat()),
+                parent_event_ids=(consumed.event_id, applied.event_id)))
+
+        retired = self.store.append(CognitiveEvent(
+            session_id=session, kind=EventKind.SEED_RETIRED,
+            source_kind=SourceKind.USER, source_ref="user",
+            created_at=(now + timedelta(seconds=8)).isoformat(),
+            payload={"seed_id": seed["seed_id"], "reason": "user_revoke"},
+            parent_event_ids=(applied.event_id,)))
+        retired_payload = dict(context_payload, context_id="retired_context",
+                               created_at=(now + timedelta(seconds=9)).isoformat(),
+                               context_digest="0" * 64)
+        retired_payload["context_digest"] = SQLiteEventStore.expedition_seed_context_digest(retired_payload)
+        with self.assertRaisesRegex(ValueError, "current active seed authorities"):
+            self.store.append(CognitiveEvent(
+                session_id=session, kind=EventKind.EXPEDITION_SEED_CONTEXT,
+                source_kind=SourceKind.POLICY, source_ref="SeedGuidanceProjector",
+                created_at=retired_payload["created_at"], payload=retired_payload,
+                parent_event_ids=(consumed.event_id, applied.event_id)))
+        self.assertEqual(EventKind.SEED_RETIRED, retired.kind)
+
+        # A caller cannot revive an expired policy by supplying an old event
+        # timestamp: automatic authority is checked against the trusted host
+        # clock before uniqueness or lineage processing.
+        self.store._trusted_clock = lambda: now + timedelta(hours=2)
+        backdated = dict(eligibility_payload, eligibility_id="eligibility_backdated")
+        with self.assertRaisesRegex(ValueError, "trusted host clock"):
+            self.store.append(CognitiveEvent(
+                session_id=session, kind=EventKind.SEED_AUTO_ELIGIBILITY,
+                source_kind=SourceKind.POLICY, source_ref="StandingSeedPolicy",
+                payload=backdated,
+                parent_event_ids=(proposal.event_id, policy.event_id),
+                created_at=backdated["evaluated_at"]))
+
+        with self.assertRaises(ValueError):
+            self.store.append(CognitiveEvent(
+                session_id=session, kind=EventKind.SEED_AUTO_APPLIED,
+                source_kind=SourceKind.USER, source_ref="user", payload=application_payload,
+                parent_event_ids=(eligibility.event_id, proposal.event_id, policy.event_id)))

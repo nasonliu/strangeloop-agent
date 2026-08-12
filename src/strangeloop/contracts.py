@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
@@ -82,6 +83,14 @@ class EventKind(str, Enum):
     SEED_PROPOSED = "seed_proposed"
     SEED_APPROVED = "seed_approved"
     SEED_RETIRED = "seed_retired"
+    # A user-issued, bounded authorization for deterministic host-side seed
+    # maintenance.  Models still only propose; these records do not grant a
+    # model authority to approve persistent memory or high-impact changes.
+    SEED_STANDING_POLICY = "seed_standing_policy"
+    SEED_STANDING_POLICY_REVOKED = "seed_standing_policy_revoked"
+    SEED_UPDATE_PROPOSED = "seed_update_proposed"
+    SEED_AUTO_ELIGIBILITY = "seed_auto_eligibility"
+    SEED_AUTO_APPLIED = "seed_auto_applied"
     SELF_CLAIM_PROPOSED = "self_claim_proposed"
     SELF_CLAIM_APPROVED = "self_claim_approved"
     SELF_CLAIM_REVOKED = "self_claim_revoked"
@@ -126,6 +135,10 @@ class EventKind(str, Enum):
     # It is operational authorization metadata, never memory or self evidence.
     EXPEDITION_AUTHORIZATION = "expedition_authorization"
     EXPEDITION_AUTHORIZATION_CONSUMED = "expedition_authorization_consumed"
+    # A bounded, host-projected review preference for an already-authorized
+    # public-web expedition.  It is neither a capability grant nor a reward,
+    # and contains no seed cue text or model-private reasoning.
+    EXPEDITION_SEED_CONTEXT = "expedition_seed_context"
 
 
 class SourceKind(str, Enum):
@@ -238,6 +251,36 @@ class ActionProposal:
 
 
 @dataclass(frozen=True)
+class SeedGuidance:
+    """A host-computed, non-authoritative review-style preference.
+
+    This deliberately excludes seed cues, user text, provenance, confidence,
+    strength, nonces, and any operational authority.  It is an inspectable
+    projection for a single request, not a persistent memory update or a
+    command to use tools, alter quotas, sleep, stop, or grant permission.
+    """
+
+    seed_id: str
+    current_authority_event_id: str
+    snapshot_digest: str
+    directive: str = "request_human_review"
+    priority_band: str = "primary"
+
+    def __post_init__(self) -> None:
+        for value, name in ((self.seed_id, "seed_id"),
+                            (self.current_authority_event_id, "current_authority_event_id")):
+            if not isinstance(value, str) or not value or len(value) > 128:
+                raise ValueError("%s must be a bounded identifier" % name)
+        if (not isinstance(self.snapshot_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", self.snapshot_digest) is None):
+            raise ValueError("snapshot_digest must be a lowercase sha256 digest")
+        if self.directive != "request_human_review":
+            raise ValueError("seed guidance has a fixed review directive")
+        if self.priority_band not in ("primary", "secondary"):
+            raise ValueError("seed guidance priority band is unsupported")
+
+
+@dataclass(frozen=True)
 class WorkspaceFrame:
     turn_id: str
     observation_event_ids: Tuple[str, ...]
@@ -251,6 +294,13 @@ class WorkspaceFrame:
     loop_tick_event_ids: Tuple[str, ...] = ()
     reward_event_ids: Tuple[str, ...] = ()
     value_estimate_event_ids: Tuple[str, ...] = ()
+    seed_guidance: Tuple[SeedGuidance, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.seed_guidance) > 2:
+            raise ValueError("a workspace may contain at most two seed guidance records")
+        if not all(isinstance(item, SeedGuidance) for item in self.seed_guidance):
+            raise TypeError("seed_guidance must contain SeedGuidance records")
 
 
 @dataclass(frozen=True)

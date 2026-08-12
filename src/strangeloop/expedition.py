@@ -132,6 +132,43 @@ class FrontierRanker(Protocol):
 
 
 @dataclass(frozen=True)
+class SeedGuidanceSnapshot:
+    """A bounded host projection of active seed authority.
+
+    This is deliberately *not* a seed record.  It carries only opaque authority
+    references plus a digest verified by the integrating runtime; cues, source
+    observations, model text, and any private provenance are excluded.  The
+    sole v1 directive expresses a review preference and cannot grant a tool,
+    change a budget, or create a frontier task.
+    """
+
+    seed_ids: Tuple[str, ...]
+    authority_event_ids: Tuple[str, ...]
+    digest: str
+    directive: str = "request_human_review"
+    version: str = "seed_guidance_v1"
+
+    def __post_init__(self) -> None:
+        if (not self.seed_ids or len(self.seed_ids) > 2
+                or len(self.seed_ids) != len(self.authority_event_ids)):
+            raise ValueError("seed guidance must contain one or two aligned authority references")
+        for collection, name in ((self.seed_ids, "seed_ids"),
+                                 (self.authority_event_ids, "authority_event_ids")):
+            if (len(set(collection)) != len(collection)
+                    or any(not isinstance(item, str) or not item or len(item) > 160
+                           for item in collection)):
+                raise ValueError("%s must contain unique bounded opaque identifiers" % name)
+        _sha256_digest(self.digest, "seed guidance digest")
+        if self.directive != "request_human_review" or self.version != "seed_guidance_v1":
+            raise ValueError("seed guidance must use the fixed v1 review directive")
+
+    def public_snapshot(self) -> Dict[str, object]:
+        """Redacted monitor/runtime projection; never exposes seed cue content."""
+        return {"digest": self.digest, "seed_count": len(self.seed_ids),
+                "directive": self.directive, "version": self.version}
+
+
+@dataclass(frozen=True)
 class ExpeditionConfig:
     """Bounds for a user-authorized foreground expedition."""
 
@@ -242,11 +279,15 @@ class SliceDecision:
     task: FrontierTask
     max_seconds: int
     selection_reason: str = "legacy_persona_rotation"
+    seed_guidance: Optional[Dict[str, object]] = None
 
     def public_snapshot(self) -> Dict[str, object]:
-        return {"slice_number": self.slice_number, "persona": self.persona.value,
-                "max_seconds": self.max_seconds, "selection_reason": self.selection_reason,
-                "task": self.task.public_snapshot()}
+        result = {"slice_number": self.slice_number, "persona": self.persona.value,
+                  "max_seconds": self.max_seconds, "selection_reason": self.selection_reason,
+                  "task": self.task.public_snapshot()}
+        if self.seed_guidance is not None:
+            result["seed_guidance"] = dict(self.seed_guidance)
+        return result
 
 
 class ExpeditionScheduler:
@@ -287,11 +328,30 @@ class ExpeditionScheduler:
         }
         self._last_selection_reason: Optional[str] = None
         self._last_experiment_selected_slice = 0
+        self._seed_guidance: Optional[SeedGuidanceSnapshot] = None
         self._create_initial_frontier()
 
     @property
     def state(self) -> ExpeditionState:
         return self._state
+
+    def set_seed_guidance(self, snapshot: Optional[SeedGuidanceSnapshot]) -> None:
+        """Install the host-verified guidance projection for a future slice.
+
+        The scheduler accepts no seed text and refuses a mid-slice update, so a
+        changed seed can influence a later choice but never mutate an already
+        authorized action.  ``None`` removes the projection and restores the
+        legacy trajectory.
+        """
+        if snapshot is not None and not isinstance(snapshot, SeedGuidanceSnapshot):
+            raise ValueError("seed guidance must be a SeedGuidanceSnapshot or None")
+        if self._active_task_id is not None:
+            raise RuntimeError("cannot change seed guidance during an active slice")
+        self._seed_guidance = snapshot
+
+    def seed_guidance_snapshot(self) -> Optional[Dict[str, object]]:
+        """Return the redacted active guidance projection, if any."""
+        return None if self._seed_guidance is None else self._seed_guidance.public_snapshot()
 
     def begin_slice(self, now: Optional[datetime] = None) -> Optional[SliceDecision]:
         """Select one bounded target.  It never performs the selected action."""
@@ -320,7 +380,7 @@ class ExpeditionScheduler:
         self._persona_last_selected_slice[task.persona] = self._slice_number
         self._last_selection_reason = selection_reason
         return SliceDecision(self._slice_number, task.persona, task, self.config.max_slice_seconds,
-                             selection_reason)
+                             selection_reason, self.seed_guidance_snapshot())
 
     def defer_quota_retry(self, reason: str, retry_at: datetime,
                           now: Optional[datetime] = None) -> Dict[str, object]:
@@ -489,7 +549,7 @@ class ExpeditionScheduler:
         counts = {status.value: 0 for status in FrontierStatus}
         for task in self._tasks.values():
             counts[task.status.value] += 1
-        return {
+        result = {
             "state": self._state.value,
             "stop_reason": self._stop_reason,
             "seed_digest": self._seed_digest,
@@ -518,6 +578,9 @@ class ExpeditionScheduler:
                 "no_raw_seed_urls_queries_page_bodies_or_hidden_reasoning",
             ],
         }
+        if self._seed_guidance is not None:
+            result["seed_guidance"] = self.seed_guidance_snapshot()
+        return result
 
     def candidate_snapshot(self) -> Dict[str, object]:
         """Latest ranker input, limited to public task descriptors and state."""
@@ -588,6 +651,9 @@ class ExpeditionScheduler:
             self._record_candidate_snapshot(baseline, persona, "not_configured")
             if experiment_due:
                 return self._baseline_task(experiments), "experiment_cadence_due"
+            guided = self._seed_guided_task(baseline)
+            if guided is not None:
+                return guided, "seed_guidance_request_human_review"
             return self._baseline_task(baseline), "legacy_persona_rotation"
 
         # In active mode all eligible frontier arms are visible to the ranker;
@@ -599,10 +665,16 @@ class ExpeditionScheduler:
                       else "ranker_shadow_invalid_baseline")
             if experiment_due:
                 return self._baseline_task(experiments), "experiment_cadence_due_shadow"
+            guided = self._seed_guided_task(baseline)
+            if guided is not None:
+                return guided, "seed_guidance_request_human_review"
             return self._baseline_task(baseline), reason
         if recommendation is None:
             if experiment_due:
                 return self._baseline_task(experiments), "experiment_cadence_due"
+            guided = self._seed_guided_task(baseline)
+            if guided is not None:
+                return guided, "seed_guidance_request_human_review"
             return self._baseline_task(baseline), "ranker_invalid_fallback"
         # A ranker can influence priority but cannot indefinitely starve the
         # persona whose bounded turn is due.  The full ranking is still
@@ -618,7 +690,37 @@ class ExpeditionScheduler:
             # A valid full ranking must include every eligible experiment;
             # retain this closed fallback for future eligibility changes.
             return self._baseline_task(experiments), "experiment_cadence_due"
+        guided = self._seed_guided_task([self._tasks[task_id] for task_id in recommendation])
+        if guided is not None:
+            return guided, "seed_guidance_request_human_review"
         return self._tasks[recommendation[0]], "ranker_active_recommendation"
+
+    def _seed_guided_task(self, candidates: Sequence[FrontierTask]) -> Optional[FrontierTask]:
+        """Soft-rank existing web candidates under the fixed review directive.
+
+        This runs only after all host hard gates.  Experiments are excluded,
+        and the sequence passed in already represents either persona baseline
+        order or a valid ranker recommendation.  Without a matching preferred
+        descriptor this returns ``None`` rather than perturbing the legacy
+        ordering.
+        """
+        if self._seed_guidance is None:
+            return None
+        preferred_stances = frozenset(("counterevidence", "limitation"))
+        preferred_actions = frozenset(("citation_trace", "source_triangulation"))
+        eligible = [item for item in candidates if item.experiment_kind is None]
+        decorated = []
+        for index, item in enumerate(eligible):
+            stance = item.evidence_stance in preferred_stances
+            action = item.action_mode in preferred_actions
+            # A pair best embodies the bounded review directive.  The input
+            # order deterministically resolves ties, preserving ranker or
+            # baseline order among equally suitable candidates.
+            preference = 0 if stance and action else 1 if stance else 2 if action else 3
+            decorated.append((preference, index, item))
+        if not decorated or min(item[0] for item in decorated) == 3:
+            return None
+        return min(decorated, key=lambda item: (item[0], item[1]))[2]
 
     def _experiment_due(self) -> bool:
         """At most one offline experiment per persona cycle; at least one in it."""
@@ -693,11 +795,14 @@ class ExpeditionScheduler:
 
     def _record_candidate_snapshot(self, candidates: Sequence[FrontierTask], persona: Persona,
                                    recommendation_status: str) -> None:
+        context = {"state": self._state.value, "slice_number": self._slice_number,
+                   "scheduled_persona": persona.value, "candidate_count": len(candidates),
+                   "max_slice_seconds": self.config.max_slice_seconds}
+        if self._seed_guidance is not None:
+            context["seed_guidance"] = self.seed_guidance_snapshot()
         self._last_candidate_snapshot = {
             "candidates": [self._ranker_descriptor(item) for item in candidates],
-            "state_context": {"state": self._state.value, "slice_number": self._slice_number,
-                              "scheduled_persona": persona.value, "candidate_count": len(candidates),
-                              "max_slice_seconds": self.config.max_slice_seconds},
+            "state_context": context,
             "recommendation_status": recommendation_status,
         }
 

@@ -10,6 +10,7 @@ import sys
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
+from uuid import uuid4
 
 from .engine import StrangeloopAgent
 from .autoloop import LoopConfig
@@ -31,7 +32,8 @@ from .improvement import ConstitutionalKernelManifest, ProtectedImprovementContr
 from .sleep import SleepWakeCoordinator, SleepWakePolicy
 from .memory import SessionMemoryManager
 from .monitor import CognitiveMonitor
-from .seeds import SQLiteSeedStore
+from .seeds import (SQLiteSeedStore, SeedStandingPolicy,
+                    standing_policy_manifest)
 from .self_model import EventSourcedSelfModel
 from .store import SQLiteEventStore
 from .td import RewardSource
@@ -68,6 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="bounded host-side frontier ranking; active requires v2 USER authorization")
     parser.add_argument("--expedition-experiments", action="store_true",
                         help="explicitly authorize bounded offline fixture experiments; requires active or shadow learning")
+    parser.add_argument("--seed-auto-update", action="store_true",
+                        help="issue one seven-day bounded standing policy for automatic low-impact seed maintenance")
     return parser
 
 
@@ -237,6 +241,18 @@ def run_repl(agent: StrangeloopAgent, inputs: Optional[Iterable[str]] = None,
                         print("Reward and TD update recorded: %s %s" % (reward.event_id, update.event_id))
                 except (ValueError, RuntimeError) as error:
                     print("Reward refused: " + str(error))
+        elif command == "/seed-auto" or command == "/seed-auto status":
+            print(json.dumps(agent.seed_auto_update_status(), ensure_ascii=False, sort_keys=True))
+        elif command == "/seed-auto start":
+            try:
+                print(json.dumps(_start_seed_auto_update(agent), ensure_ascii=False, sort_keys=True))
+            except (RuntimeError, ValueError, PermissionError) as error:
+                print("Seed auto-update refused: " + str(error))
+        elif command == "/seed-auto stop":
+            try:
+                print(json.dumps(_stop_seed_auto_update(agent), ensure_ascii=False, sort_keys=True))
+            except (RuntimeError, ValueError, PermissionError) as error:
+                print("Seed auto-update refused: " + str(error))
         elif command == "/seeds":
             print(json.dumps([seed.seed_id + ":" + seed.status.value for seed in agent.seed_store.list(agent.session_id)]))
         elif command.startswith("/approve "):
@@ -545,6 +561,46 @@ def _user_command_event(agent: StrangeloopAgent, summary: str):
     ))
 
 
+def _start_seed_auto_update(agent: StrangeloopAgent) -> dict:
+    """Turn one explicit CLI choice into a bounded standing authorization."""
+    current = agent.seed_store.standing_policy_status(agent.session_id)
+    if current is not None and current.get("status") == "active":
+        return agent.seed_auto_update_status()
+    issued = datetime.now(timezone.utc)
+    issued_at = issued.isoformat()
+    approval_event_id = "evt_%s" % uuid4().hex
+    policy_id = "seedpolicy_%s" % uuid4().hex
+    nonce = "nonce_%s" % uuid4().hex
+    policy = SeedStandingPolicy(
+        expires_at=(issued + timedelta(days=7)).isoformat())
+    _payload, policy_digest = standing_policy_manifest(
+        policy, policy_id, approval_event_id, nonce, issued_at)
+    approval = agent.event_store.append(CognitiveEvent(
+        session_id=agent.session_id, kind=EventKind.OBSERVATION,
+        source_kind=SourceKind.USER, source_ref="cli_user_command",
+        payload={"approval": "seed_standing_policy",
+                 "policy_digest": policy_digest, "nonce": nonce},
+        event_id=approval_event_id, created_at=issued_at,
+    ))
+    return agent.enable_seed_auto_update(
+        approval.event_id, policy, policy_id, nonce, issued_at)
+
+
+def _stop_seed_auto_update(agent: StrangeloopAgent) -> dict:
+    """Revoke the latest active standing policy from one explicit CLI choice."""
+    current = agent.seed_store.standing_policy_status(agent.session_id)
+    if current is None or current.get("status") != "active":
+        return agent.seed_auto_update_status()
+    approval = agent.event_store.append(CognitiveEvent(
+        session_id=agent.session_id, kind=EventKind.OBSERVATION,
+        source_kind=SourceKind.USER, source_ref="cli_user_command",
+        payload={"approval": "seed_standing_policy_revoke",
+                 "policy_id": current["policy_id"],
+                 "policy_event_id": current["event_id"]},
+    ))
+    return agent.disable_seed_auto_update(approval.event_id)
+
+
 def _handle_grant_command(agent: StrangeloopAgent, command: str) -> None:
     if agent.tool_session is None:
         print("Tool grants unavailable.")
@@ -721,6 +777,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                                  improvement_control=ProtectedImprovementControlPlane(manifest),
                                  sleep_coordinator=SleepWakeCoordinator(SleepWakePolicy(threshold=0.10)))
         agent.usage_adapter = usage_adapter
+        # The flag itself is the user's one explicit enable action.  The host
+        # records its exact standing authorization before any text turn can
+        # propose a seed; subsequent bounded seed actions need no per-seed
+        # prompt and receive no tool, reward, quota, or lifecycle authority.
+        if args.seed_auto_update:
+            print(json.dumps({"seed_auto_update": _start_seed_auto_update(agent)},
+                             ensure_ascii=False, sort_keys=True))
         # This flag is the user's explicit authorization, recorded before any
         # quota outcome can create a sleep epoch.  No model, webpage, or tool
         # output can enable it.
@@ -751,6 +814,18 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                         raise ValueError("--expedition-experiments requires --expedition-learning-mode active or shadow")
                     experiment_policy = ExperimentRegistryPolicy(tuple(ExperimentKind), max_experiments=8,
                                                                  max_trials=16, max_steps=1000, max_wall_ms=500)
+                # When both explicit flags are present, the user has supplied
+                # one bounded expedition goal and one standing seed policy.
+                # Record that exact goal as USER input before the expedition
+                # contract, so the host may derive one bounded seed without a
+                # model proposal or any per-seed prompt.
+                goal_observation = None
+                if args.seed_auto_update:
+                    goal_observation = agent.event_store.append(CognitiveEvent(
+                        session_id=agent.session_id, kind=EventKind.OBSERVATION,
+                        source_kind=SourceKind.USER, source_ref="cli_user_command",
+                        payload={"content": args.expedition_goal,
+                                 "channel": "expedition_seed_input"}))
                 # Record the one real USER authorization before provider
                 # telemetry can place the process into a sleep epoch.  Every
                 # later slice reuses this bounded authority; it never fabricates
@@ -764,6 +839,22 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                         args.expedition_max_calls_per_slice, args.expedition_learning_mode, learner_spec,
                         experiment_policy),
                         "channel": "expedition_authorization"}))
+                if goal_observation is not None:
+                    seed_decision = agent.event_store.append(CognitiveEvent(
+                        session_id=agent.session_id, kind=EventKind.DECISION,
+                        source_kind=SourceKind.POLICY, source_ref="SeedGuidanceProjector",
+                        payload={"turn_id": "expedition_seed_%s" % goal_observation.event_id,
+                                 "observation_event_ids": [goal_observation.event_id],
+                                 "retrieved_seed_ids": [], "self_claim_ids": [],
+                                 "selected_action": {"action_type": "response",
+                                                     "required_capability": None,
+                                                     "is_mutating": False,
+                                                     "public_summary": "Action proposal recorded for policy review."},
+                                 "public_summary": "Policy decision recorded for this turn.",
+                                 "policy_reasons": ["standing_seed_policy"]},
+                        parent_event_ids=(goal_observation.event_id,)))
+                    agent.auto_seed_from_expedition_goal(
+                        args.expedition_goal, goal_observation.event_id, seed_decision.event_id)
                 issued = datetime.now(timezone.utc)
                 authorization = agent.event_store.append(CognitiveEvent(
                     session_id=agent.session_id, kind=EventKind.EXPEDITION_AUTHORIZATION,

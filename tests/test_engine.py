@@ -4,13 +4,16 @@ import struct
 import tempfile
 import unittest
 import json
+import threading
+from uuid import uuid4
 
 from strangeloop.contracts import (ActionProposal, CognitiveEvent, Deliberation,
                                   EventKind, SeedDisposition, SourceKind)
 from strangeloop.engine import StrangeloopAgent
 from strangeloop.deliberation import TransparentHeuristicDeliberator
 from strangeloop.autoloop import LoopConfig
-from strangeloop.seeds import SQLiteSeedStore
+from strangeloop.seeds import (SQLiteSeedStore, SeedStandingPolicy,
+                               standing_policy_manifest)
 from strangeloop.self_model import EventSourcedSelfModel
 from strangeloop.store import SQLiteEventStore
 from strangeloop.td import RewardSource
@@ -81,6 +84,59 @@ class MaliciousSeedDeliberator:
         )
         return Deliberation("Safe response.", (), (), (),
                            ActionProposal("response", "safe"), malicious_seed)
+
+
+class NoSeedDeliberator:
+    def deliberate(self, prompt, workspace):
+        del prompt, workspace
+        return Deliberation(
+            "A bounded response.", (), (), (),
+            ActionProposal("response", "respond"), None)
+
+
+class GuidanceCapturingDeliberator:
+    def __init__(self):
+        self.workspaces = []
+
+    def deliberate(self, prompt, workspace):
+        del prompt
+        self.workspaces.append(workspace)
+        return Deliberation("A bounded response.", (), (), (),
+                           ActionProposal("response", "respond"), None)
+
+
+def enable_seed_auto_update(agent, **limits):
+    issued = datetime.now(timezone.utc)
+    issued_at = issued.isoformat()
+    approval_event_id = "evt_%s" % uuid4().hex
+    policy_id = "seedpolicy_%s" % uuid4().hex
+    nonce = "nonce_%s" % uuid4().hex
+    policy = SeedStandingPolicy(
+        expires_at=(issued + timedelta(days=7)).isoformat(), **limits)
+    _payload, digest = standing_policy_manifest(
+        policy, policy_id, approval_event_id, nonce, issued_at)
+    approval = agent.event_store.append(CognitiveEvent(
+        session_id=agent.session_id, kind=EventKind.OBSERVATION,
+        source_kind=SourceKind.USER, source_ref="test_user_command",
+        payload={"approval": "seed_standing_policy",
+                 "policy_digest": digest, "nonce": nonce},
+        event_id=approval_event_id, created_at=issued_at,
+    ))
+    agent.enable_seed_auto_update(
+        approval.event_id, policy, policy_id, nonce, issued_at)
+    return policy_id
+
+
+def disable_seed_auto_update(agent):
+    current = agent.seed_store.standing_policy_status(agent.session_id)
+    approval = agent.event_store.append(CognitiveEvent(
+        session_id=agent.session_id, kind=EventKind.OBSERVATION,
+        source_kind=SourceKind.USER, source_ref="test_user_command",
+        payload={"approval": "seed_standing_policy_revoke",
+                 "policy_id": current["policy_id"],
+                 "policy_event_id": current["event_id"]},
+    ))
+    return agent.disable_seed_auto_update(approval.event_id)
 
 
 class FakeK3Transport:
@@ -620,6 +676,232 @@ class EngineTests(unittest.TestCase):
         self.assertEqual("request-human-review", seed.policy_bias)
         self.assertEqual("conversation", seed.scope)
         self.assertEqual(.25, seed.strength)
+
+    def test_seed_auto_requires_policy_and_works_without_model_seed_proposal(self):
+        agent = StrangeloopAgent(session_id="seed-auto-required",
+                                 deliberator=NoSeedDeliberator())
+        plain = agent.run_turn("研究好奇心")
+        self.assertEqual((), plain.seed_proposal_ids)
+        self.assertEqual([], agent.seed_store.list(agent.session_id))
+
+        enable_seed_auto_update(agent)
+        first = agent.run_turn("研究好奇心")
+        seeds = agent.seed_store.list(agent.session_id)
+        self.assertEqual(1, len(seeds))
+        self.assertEqual("active", seeds[0].status.value)
+        self.assertEqual((), first.decision.retrieved_seed_ids)
+        self.assertNotIn("current-input", seeds[0].cue_terms)
+        self.assertLessEqual(len(seeds[0].cue_terms), 2)
+        self.assertTrue(all(len(cue) <= 24 for cue in seeds[0].cue_terms))
+        self.assertTrue(any("no per-seed approval" in notice for notice in first.notices))
+
+        second = agent.run_turn("我想研究好奇心")
+        reinforced = agent.seed_store.list(agent.session_id)
+        self.assertEqual(1, len(reinforced))
+        self.assertEqual((reinforced[0].seed_id,), second.decision.retrieved_seed_ids)
+        self.assertEqual(3, reinforced[0].version)
+        self.assertGreater(reinforced[0].strength, seeds[0].strength)
+
+        original_version = reinforced[0].version
+        agent.run_turn("量子引力观测")
+        by_id = dict((seed.seed_id, seed) for seed in agent.seed_store.list(agent.session_id))
+        self.assertEqual(original_version, by_id[reinforced[0].seed_id].version)
+        self.assertEqual(2, len(by_id))
+
+    def test_auto_seed_guidance_is_host_projected_and_only_affects_next_turn(self):
+        deliberator = GuidanceCapturingDeliberator()
+        agent = StrangeloopAgent(session_id="seed-guidance-next-turn", deliberator=deliberator)
+        enable_seed_auto_update(agent)
+        first = agent.run_turn("research curiosity")
+        self.assertEqual((), first.decision.retrieved_seed_ids)
+        self.assertEqual((), deliberator.workspaces[0].seed_guidance)
+        seed = agent.seed_store.list(agent.session_id)[0]
+        second = agent.run_turn("research curiosity")
+        guidance = deliberator.workspaces[1].seed_guidance
+        self.assertEqual((seed.seed_id,), second.decision.retrieved_seed_ids)
+        self.assertEqual(1, len(guidance))
+        self.assertEqual(seed.seed_id, guidance[0].seed_id)
+        self.assertEqual("request_human_review", guidance[0].directive)
+        self.assertEqual("primary", guidance[0].priority_band)
+        rendered = repr(guidance[0])
+        for secret in (*seed.cue_terms, seed.policy_bias, seed.provenance_event_ids[0]):
+            self.assertNotIn(secret, rendered)
+
+    def test_seed_auto_ignores_malicious_model_seed_proposal(self):
+        agent = StrangeloopAgent(session_id="seed-auto-model-isolation",
+                                 deliberator=MaliciousSeedDeliberator())
+        enable_seed_auto_update(agent)
+        result = agent.run_turn("研究 好奇心")
+        seed = agent.seed_store.list(agent.session_id)[0]
+        self.assertEqual("active", seed.status.value)
+        self.assertNotIn(MaliciousSeedDeliberator.marker, repr(agent.export_session()))
+        self.assertEqual(agent._seed_cue_terms("研究 好奇心"), seed.cue_terms)
+        self.assertTrue(any("no per-seed approval" in notice
+                            for notice in result.notices))
+
+    def test_seed_auto_revoke_stops_new_actions_and_retired_identity_stays_retired(self):
+        agent = StrangeloopAgent(session_id="seed-auto-revoke",
+                                 deliberator=NoSeedDeliberator())
+        enable_seed_auto_update(agent, max_counterevidence=1)
+        first = agent.run_turn("好奇心实验")
+        counter = agent.event_store.append(CognitiveEvent(
+            session_id=agent.session_id, kind=EventKind.OBSERVATION,
+            source_kind=SourceKind.USER, source_ref="user",
+            payload={"content": "这个结果不成立", "channel": "text"},
+        ))
+        agent.record_correction(first.event_ids[2], counter.event_id)
+        retired = agent.seed_store.list(agent.session_id)[0]
+        self.assertEqual("retired", retired.status.value)
+
+        # An active policy cannot revive an identity tombstone.
+        agent.run_turn("请研究好奇心实验")
+        self.assertEqual(1, len(agent.seed_store.list(agent.session_id)))
+        self.assertEqual("retired", agent.seed_store.list(agent.session_id)[0].status.value)
+
+        status = disable_seed_auto_update(agent)
+        self.assertEqual("revoked", status["state"])
+        self.assertTrue(status["per_seed_confirmation_required"])
+        before = len(agent.seed_store.list(agent.session_id))
+        agent.run_turn("量子引力观测")
+        self.assertEqual(before, len(agent.seed_store.list(agent.session_id)))
+
+    def test_user_correction_auto_tightens_then_retires_but_external_only_records(self):
+        agent = StrangeloopAgent(session_id="seed-auto-correction",
+                                 deliberator=NoSeedDeliberator())
+        enable_seed_auto_update(agent, max_counterevidence=2)
+        first = agent.run_turn("可证伪实验")
+        initial = agent.seed_store.list(agent.session_id)[0]
+
+        external = agent.event_store.append(CognitiveEvent(
+            session_id=agent.session_id, kind=EventKind.OBSERVATION,
+            source_kind=SourceKind.EXTERNAL_VERIFIER, source_ref="verifier",
+            payload={"content": "external conflict", "channel": "text"},
+        ))
+        agent.record_correction(first.event_ids[2], external.event_id,
+                                SourceKind.EXTERNAL_VERIFIER, "verifier")
+        unchanged = agent.seed_store.list(agent.session_id)[0]
+        self.assertEqual(initial.version, unchanged.version)
+
+        for index, expected in ((1, "active"), (2, "retired")):
+            counter = agent.event_store.append(CognitiveEvent(
+                session_id=agent.session_id, kind=EventKind.OBSERVATION,
+                source_kind=SourceKind.USER, source_ref="user",
+                payload={"content": "user counterexample %d" % index,
+                         "channel": "text"},
+            ))
+            agent.record_correction(first.event_ids[2], counter.event_id)
+            current = agent.seed_store.list(agent.session_id)[0]
+            self.assertEqual(expected, current.status.value)
+            self.assertEqual(index, current.counterevidence)
+        operations = [event.payload["operation"]
+                      for event in agent.event_store.list(agent.session_id)
+                      if event.kind == EventKind.SEED_AUTO_APPLIED
+                      and event.payload["operation"] != "activate"]
+        self.assertEqual(["tighten", "retire"], operations)
+
+    def test_seed_auto_capacity_does_not_accumulate_rejected_candidates(self):
+        agent = StrangeloopAgent(session_id="seed-auto-capacity",
+                                 deliberator=NoSeedDeliberator())
+        enable_seed_auto_update(
+            agent, max_auto_activations=2, max_active_seeds=2)
+        for index in range(6):
+            agent.run_turn("alpha%d topic%d" % (index, index))
+        seeds = agent.seed_store.list(agent.session_id)
+        proposals = [event for event in agent.event_store.list(agent.session_id)
+                     if event.kind == EventKind.SEED_PROPOSED]
+        self.assertEqual(2, len(seeds))
+        self.assertEqual(2, len(proposals))
+        self.assertTrue(all(seed.status.value == "active" for seed in seeds))
+
+    def test_seed_auto_concurrent_same_lexical_identity_has_one_seed(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "events.sqlite3")
+            initial_store = SQLiteEventStore(path)
+            initial = StrangeloopAgent(
+                session_id="seed-auto-concurrent", event_store=initial_store,
+                deliberator=NoSeedDeliberator())
+            enable_seed_auto_update(initial)
+            initial_store.close()
+
+            barrier = threading.Barrier(2)
+            failures = []
+
+            def run_worker():
+                store = SQLiteEventStore(path)
+                try:
+                    agent = StrangeloopAgent(
+                        session_id="seed-auto-concurrent", event_store=store,
+                        deliberator=NoSeedDeliberator())
+                    barrier.wait(timeout=5)
+                    agent.run_turn("研究 好奇心")
+                except BaseException as error:
+                    failures.append(error)
+                finally:
+                    store.close()
+
+            workers = [threading.Thread(target=run_worker) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=10)
+            self.assertFalse(any(worker.is_alive() for worker in workers))
+            self.assertEqual([], failures)
+
+            read_store = SQLiteEventStore(path)
+            try:
+                seed_store = SQLiteSeedStore(read_store)
+                seeds = seed_store.list("seed-auto-concurrent")
+                events = read_store.list("seed-auto-concurrent")
+                self.assertEqual(1, len(seeds))
+                self.assertEqual("active", seeds[0].status.value)
+                # A concurrent observation may predate the winning activation
+                # and therefore be ineligible reinforcement evidence, but it
+                # must never create a second candidate or active identity.
+                self.assertIn(seeds[0].version, (2, 3))
+                self.assertEqual(1, sum(event.kind == EventKind.SEED_PROPOSED
+                                        for event in events))
+                self.assertEqual(0, sum(seed.status.value == "candidate"
+                                        for seed in seeds))
+                self.assertTrue(read_store.verify_chain("seed-auto-concurrent"))
+            finally:
+                read_store.close()
+
+    def test_all_seed_events_are_excluded_from_feedback_and_td_targets(self):
+        auto_drives = DualIntrinsicDrives()
+        auto = StrangeloopAgent(session_id="seed-auto-isolation",
+                                deliberator=NoSeedDeliberator(), drives=auto_drives)
+        enable_seed_auto_update(auto)
+        auto.run_turn("curiosity experiment")
+        auto.run_turn("curiosity experiment")
+        disable_seed_auto_update(auto)
+
+        legacy_drives = DualIntrinsicDrives()
+        legacy = StrangeloopAgent(session_id="seed-legacy-isolation",
+                                  deliberator=CandidateDeliberator(), drives=legacy_drives)
+        turn = legacy.run_turn("receipt")
+        legacy.approve_seed(turn.seed_proposal_ids[0])
+        legacy.retire_seed(turn.seed_proposal_ids[0])
+
+        expected = {
+            EventKind.SEED_PROPOSED, EventKind.SEED_APPROVED,
+            EventKind.SEED_RETIRED, EventKind.SEED_STANDING_POLICY,
+            EventKind.SEED_STANDING_POLICY_REVOKED,
+            EventKind.SEED_UPDATE_PROPOSED, EventKind.SEED_AUTO_ELIGIBILITY,
+            EventKind.SEED_AUTO_APPLIED,
+        }
+        seen = set()
+        for current in (auto, legacy):
+            before = current.drives.values()
+            for event in current.event_store.list(current.session_id):
+                if event.kind not in expected:
+                    continue
+                seen.add(event.kind)
+                with self.assertRaises(ValueError):
+                    current.record_user_feedback(event.event_id, "accept")
+                with self.assertRaises(ValueError):
+                    current.record_value_estimate(event.event_id, "respond")
+            self.assertEqual(before, current.drives.values())
+        self.assertEqual(expected, seen)
 
     def test_correction_binds_prior_same_session_observable_events(self):
         agent = StrangeloopAgent(session_id="correction")

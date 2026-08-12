@@ -3,7 +3,7 @@ import unittest
 
 from strangeloop.expedition import (ExpeditionConfig, ExpeditionOutcome,
                                     ExpeditionScheduler, ExpeditionState,
-                                    FrontierStatus, Persona)
+                                    FrontierStatus, Persona, SeedGuidanceSnapshot)
 from strangeloop.contracts import FRONTIER_STRATEGY_ARM_VERSION, frontier_strategy_arm_id
 
 
@@ -382,6 +382,110 @@ class ExpeditionSchedulerTests(unittest.TestCase):
         decision = scheduler.begin_slice(NOW)
         self.assertEqual("td_invariants", decision.task.experiment_kind)
         self.assertEqual("experiment_cadence_due_ranker", decision.selection_reason)
+
+    @staticmethod
+    def review_guidance():
+        return SeedGuidanceSnapshot(
+            seed_ids=("seed_opaque_1",), authority_event_ids=("event_opaque_1",),
+            digest="c" * 64,
+        )
+
+    def test_guidance_soft_ranks_existing_eligible_web_descriptor_only(self):
+        scheduler = self.build()
+        first = next(task for task in scheduler._tasks.values()
+                     if task.persona == Persona.FORAGER)
+        alternate = scheduler._add_task(Persona.FORAGER, 100)
+        first.evidence_stance, first.action_mode = "support", "web_search"
+        alternate.evidence_stance, alternate.action_mode = "counterevidence", "citation_trace"
+        scheduler.set_seed_guidance(self.review_guidance())
+        decision = scheduler.begin_slice(NOW)
+        self.assertEqual(alternate.task_id, decision.task.task_id)
+        self.assertEqual("seed_guidance_request_human_review", decision.selection_reason)
+        rendered = repr(scheduler.public_snapshot())
+        self.assertIn("seed_guidance_v1", rendered)
+        self.assertIn("c" * 64, rendered)
+        self.assertNotIn("seed_opaque_1", rendered)
+        self.assertNotIn("event_opaque_1", rendered)
+
+    def test_guidance_absence_or_no_preferred_descriptor_preserves_legacy_choice(self):
+        ordinary = self.build()
+        explicit_none = self.build()
+        explicit_none.set_seed_guidance(None)
+        self.assertEqual(ordinary.begin_slice(NOW).public_snapshot(),
+                         explicit_none.begin_slice(NOW).public_snapshot())
+
+        no_match = self.build()
+        no_match.set_seed_guidance(self.review_guidance())
+        decision = no_match.begin_slice(NOW)
+        self.assertEqual("legacy_persona_rotation", decision.selection_reason)
+        self.assertEqual(Persona.FORAGER, decision.persona)
+
+    def test_guidance_cannot_bypass_fairness_or_experiment_cadence(self):
+        class PreferCurator:
+            def rank(self, candidates, state_context):
+                del state_context
+                curators = [item["task_id"] for item in candidates if item["persona"] == "curator"]
+                return curators + [item["task_id"] for item in candidates if item["task_id"] not in curators]
+
+        scheduler = ExpeditionScheduler("stable-test-seed", ExpeditionConfig(max_slices=8), NOW,
+                                        ranker=PreferCurator())
+        scheduler.set_seed_guidance(self.review_guidance())
+        for index in range(6):
+            task = scheduler._add_task(Persona.CURATOR, index + 100)
+            task.evidence_stance, task.action_mode = "limitation", "source_triangulation"
+        # Consume six choices.  Slice seven has a due Forager and must remain
+        # host-fair even though several cross-persona descriptors are preferred.
+        for number in range(6):
+            decision = scheduler.begin_slice(NOW + timedelta(seconds=number))
+            scheduler.record_outcome(decision.task.task_id, ExpeditionOutcome.BRANCH_COMPLETE,
+                                     now=NOW + timedelta(seconds=number))
+        fair = scheduler.begin_slice(NOW + timedelta(seconds=6))
+        self.assertEqual(Persona.FORAGER, fair.persona)
+        self.assertEqual("fairness_persona_due", fair.selection_reason)
+
+        experiments = ExpeditionScheduler("stable-test-seed",
+                                           self.experiment_config(
+                                               allowed_experiment_kinds=("frontier_replay",),
+                                               max_experiments=1), NOW)
+        experiments.set_seed_guidance(self.review_guidance())
+        for task in experiments._tasks.values():
+            if task.experiment_kind is None:
+                task.evidence_stance, task.action_mode = "counterevidence", "citation_trace"
+        experiments._last_experiment_selected_slice = -5
+        due = experiments.begin_slice(NOW)
+        self.assertIsNotNone(due.task.experiment_kind)
+        self.assertEqual("experiment_cadence_due", due.selection_reason)
+
+    def test_guidance_replay_is_deterministic_and_cannot_change_mid_slice(self):
+        left, right = self.build(), self.build()
+        for scheduler in (left, right):
+            scheduler.set_seed_guidance(self.review_guidance())
+            for task in scheduler._tasks.values():
+                if task.persona == Persona.FORAGER:
+                    task.evidence_stance, task.action_mode = "counterevidence", "citation_trace"
+        left_slice, right_slice = left.begin_slice(NOW), right.begin_slice(NOW)
+        self.assertEqual(left_slice.public_snapshot(), right_slice.public_snapshot())
+        with self.assertRaises(RuntimeError):
+            left.set_seed_guidance(None)
+        left.record_outcome(left_slice.task.task_id, ExpeditionOutcome.BRANCH_COMPLETE, now=NOW)
+        left.set_seed_guidance(None)
+        self.assertIsNone(left.seed_guidance_snapshot())
+
+    def test_guidance_never_enters_ranker_input(self):
+        class CapturingRanker:
+            def __init__(self):
+                self.context = None
+
+            def rank(self, candidates, state_context):
+                self.context = dict(state_context)
+                return [item["task_id"] for item in candidates]
+
+        ranker = CapturingRanker()
+        scheduler = ExpeditionScheduler("stable-test-seed", ExpeditionConfig(), NOW, ranker=ranker)
+        scheduler.set_seed_guidance(self.review_guidance())
+        scheduler.begin_slice(NOW)
+        self.assertNotIn("seed_guidance", ranker.context)
+        self.assertNotIn("c" * 64, repr(ranker.context))
 
 
 if __name__ == "__main__":
