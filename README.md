@@ -10,6 +10,8 @@
 
 默认流程保留逐条 `USER` 批准。用户也可一次性显式启用 **seed auto-update**：内部以 digest 与 nonce 绑定、可撤销且有限期的 standing authorization 让宿主在**下一 turn**自动处理合规低影响候选的 activate/reinforce/tighten/retire，不需要逐种子再次批准。模型只能提出；工具/网页、奖励、TD、实验、配额和 sleep/wake 都不能授予或驱动该更新。它不训练模型、不改变能力、配额、停止或自我模型。完整事件协议、tombstone、CAS、purge 和监控脱敏边界见：[RFC-0005](docs/RFC-0005-standing-seed-policy.md)。
 
+持久会话还包含一个可重建的 **MemoryGraph**：它只把同一 hash-chain 账本中的不透明事件 ID 和固定来源关系投影为 SQLite 图表，用于检查种子来源、纠错冲突与实验验证链。它不是记忆批准权威，不保存用户原文、网页正文、URL、cue、embedding 或隐藏推理，也不能影响工具、配额、睡眠、奖励/TD 或排序。详见 [RFC-0006](docs/RFC-0006-memory-graph.md)。
+
 ## 当前架构（RFC-0001 MVP + RFC-0002 实验切片）
 
 ```mermaid
@@ -125,6 +127,8 @@ strangeloop --memory-root ./strangeloop-memory --session expedition-001 \
 > /value evt_某个行动结果 respond
 > /reward evt_同一个行动结果 0.5
 > /seeds
+> /graph status
+> /graph explain evt_…
 > /approve seed_…
 > /retire seed_…
 > /revoke claim_…
@@ -136,6 +140,7 @@ strangeloop --memory-root ./strangeloop-memory --session expedition-001 \
 
 - `/state` 显示当前可检查的会话状态，不代表“内在体验”。
 - `/events` 按类别显示追加式来源记录；`/seeds` 显示种子状态。
+- `/graph [status|explain EVENT_ID]` 显示可从账本重建的脱敏关系图谱状态或一跳来源解释；它不是权限、奖励或检索控制面。
 - `/quota` 显示 K3 调用的宿主配额决策、遥测来源、时效和本进程可观察的 usage ledger。当前可选的 Kimi Code CLI 适配器只读取已安装 CLI 的 OAuth managed-usage 结果，并把其规范化为受限的宿主快照；它不使用普通 API key 探测未文档化余额接口、不更改 CLI 配置、不显示 token 或原始响应。没有新鲜、经认证的 provider managed-usage 遥测时，状态必须是 `unknown`；本地 ledger **不是** Kimi Code Plan 的剩余余额。软阈值会缩减推理强度、完成 token 和工具步骤；硬停止会禁止新的 K3 调用并暂停需要 K3 的循环。本地 `/loop stop`、`/export` 和 `/purge` 仍可用。配额从不作为 TD/RPE、好奇心或“存在”驱动的奖励信号。
 - `/monitor [status|start|stop]` 管理当前进程的 localhost-only 只读监视器。其 quota sleep/wake 卡只投影状态、epoch/generation、用户 auto-wake / one-shot continuation 同意的 ID 或摘要、最后一项权威观察/重置/下次检查时间、刷新结果、单次 continuation 计数以及 archive 的 ID/digest/count/head；不会投影 archive 内容、原始 Kimi 响应或凭据。
 - 监视器的 `Unattended research` 卡只投影固定的状态、profile ID、目标 digest、call/byte/tick 预算、最后的受限工具名称和状态、停止原因，以及公开报告的 digest/finding count。它不会显示目标文本、提议、参数、网页正文、URL（包括 query）、本地路径、报告 finding 文本、cookie、key 或隐藏推理。

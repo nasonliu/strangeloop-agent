@@ -31,6 +31,7 @@ from .drives import DualIntrinsicDrives
 from .improvement import ConstitutionalKernelManifest, ProtectedImprovementControlPlane
 from .sleep import SleepWakeCoordinator, SleepWakePolicy
 from .memory import SessionMemoryManager
+from .memory_graph import MemoryGraph
 from .monitor import CognitiveMonitor
 from .seeds import (SQLiteSeedStore, SeedStandingPolicy,
                     standing_policy_manifest)
@@ -135,6 +136,14 @@ def run_repl(agent: StrangeloopAgent, inputs: Optional[Iterable[str]] = None,
             print(json.dumps(agent.state(), ensure_ascii=False, sort_keys=True))
         elif command == "/events":
             print(json.dumps(agent.export_session()["records_by_category"], ensure_ascii=False))
+        elif command == "/graph" or command == "/graph status":
+            print(json.dumps(agent.memory_graph_status(), ensure_ascii=False, sort_keys=True))
+        elif command.startswith("/graph explain "):
+            event_id = command[len("/graph explain "):].strip()
+            try:
+                print(json.dumps(agent.explain_memory_event(event_id), ensure_ascii=False, sort_keys=True))
+            except ValueError as error:
+                print("Graph explanation refused: " + str(error))
         elif command == "/provider":
             print(json.dumps(agent.provider_status(), ensure_ascii=False, sort_keys=True))
         elif command == "/quota" or command == "/quota status":
@@ -300,6 +309,7 @@ def run_repl(agent: StrangeloopAgent, inputs: Optional[Iterable[str]] = None,
                 agent.event_store = reopened
                 agent.seed_store = SQLiteSeedStore(reopened)
                 agent.self_model = EventSourcedSelfModel(reopened)
+                agent.memory_graph = MemoryGraph(reopened)
             else:
                 _close_active_loop(agent)
                 agent.stop_research_autonomy("purge")

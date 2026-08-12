@@ -35,6 +35,12 @@ Strangeloop 是受唯识认知理论启发的可审计软件。它不具有、�
 - 该政策不改变 capability/grant、quota、sleep/wake、stop、reward/RPE/TD 或 self-model；不会训练、微调或部署模型权重。
 - 种子仍可查看、导出、撤销和 purge。localhost monitor 仅显示 active/revoked/expired 与自动 application 的聚合计数，不显示 cues、来源、nonce、digest、限制或证据；它不是控制面。完整协议见 [RFC-0005](RFC-0005-standing-seed-policy.md)。
 
+### 账本派生 MemoryGraph
+
+- `MemoryGraph` 是同一 SQLite 会话账本的可重建关系投影，不是第二个记忆权威。它只保存不透明 event ID、固定 relation、事件类型和 digest；不保存用户原文、网页正文、URL、cue、embedding 或隐藏推理。
+- 图谱不能批准/更新种子，不能改变工具或 capability/grant，不能进入 reward/TD、frontier ranking、quota、sleep/wake、stop 或 self-model。它只用于导出与来源/冲突/验证关系的检查。
+- 图谱与事件账本位于同一会话容器，确认 purge 时一并删除；它可由仍存在的账本重建，不承诺擦除备份、快照或外部副本。完整协议见 [RFC-0006](RFC-0006-memory-graph.md)。
+
 ## 宗教谦抑
 
 项目使用唯识术语作设计启发，不解释、替代或认证任何宗教传统。UI、文档和示例应同时说明原义、工程类比及其边界；不把软件行为称为“修行成果”“证悟”“转识成智”或“佛法验证”。有关概念与原典参照见 [GLOSSARY.md](GLOSSARY.md)。

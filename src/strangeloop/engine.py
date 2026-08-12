@@ -28,6 +28,7 @@ from .metacognition import (EvidencePolarity, MirrorAuditor, PublicEvidence)
 from .policy import PolicyGate
 from .seeds import (SQLiteSeedStore, SeedStandingPolicy,
                     canonical_seed_identity)
+from .memory_graph import MemoryGraph
 from .self_model import EventSourcedSelfModel
 from .store import SQLiteEventStore
 from .store import frontier_experiment_reward_vector
@@ -98,10 +99,16 @@ class StrangeloopAgent:
                  drives: Optional[DualIntrinsicDrives] = None,
                  improvement_control: Optional[ProtectedImprovementControlPlane] = None,
                  sleep_coordinator: Optional[SleepWakeCoordinator] = None,
+                 memory_graph: Optional[MemoryGraph] = None,
                  loop_remote_call_budget: int = 1) -> None:
         self.session_id = session_id or "session_%s" % uuid4().hex
         self.event_store = event_store or SQLiteEventStore()
         self.seed_store = seed_store or SQLiteSeedStore(self.event_store)
+        # The graph is a cache-like projection of the same event ledger.  It
+        # is not consulted for approval, policy, capability, reward, quota,
+        # sleep, or lifecycle decisions.
+        self.memory_graph = memory_graph or MemoryGraph(self.event_store)
+        self.memory_graph.ensure_current(self.session_id)
         self.self_model = self_model or EventSourcedSelfModel(self.event_store)
         if (not isinstance(loop_remote_call_budget, int)
                 or isinstance(loop_remote_call_budget, bool)
@@ -1935,6 +1942,7 @@ class StrangeloopAgent:
             seed_ids = (stored.seed_id,)
             notices.append("Seed proposal is a candidate and requires external approval.")
         self._signal_external_salience(observation.event_id, "text")
+        self.memory_graph.ensure_current(self.session_id)
         return TurnResult(
             session_id=self.session_id, response_text=response, decision=decision,
             # TurnResult continues to identify the four operational turn
@@ -2461,6 +2469,7 @@ class StrangeloopAgent:
     def export_session(self) -> Dict[str, Any]:
         """Export inspectable, current logical-session records."""
         events = self.event_store.list(self.session_id)
+        graph = self.memory_graph.ensure_current(self.session_id)
         return {
             "session_id": self.session_id,
             "events": [event.to_dict() for event in events],
@@ -2468,8 +2477,19 @@ class StrangeloopAgent:
             "seeds": [self._seed_export(seed) for seed in self.seed_store.list(self.session_id)],
             "current_claims": [self._claim_export(claim)
                                for claim in self.self_model.current_claims(self.session_id)],
+            "memory_graph": graph.to_dict(),
             "sleep": self.sleep_status(),
         }
+
+    def memory_graph_status(self) -> Dict[str, Any]:
+        """Return a refreshed, metadata-only graph projection status."""
+        return self.memory_graph.ensure_current(self.session_id).to_dict()
+
+    def explain_memory_event(self, event_id: str) -> Dict[str, Any]:
+        """Explain one event's bounded provenance neighborhood without payloads."""
+        graph = self.memory_graph.ensure_current(self.session_id)
+        return {"graph": graph.to_dict(), "event_id": event_id,
+                "neighbors": self.memory_graph.neighbors(self.session_id, event_id)}
 
     def state(self) -> dict:
         """Return inspectable current state without implying an inner experience."""
@@ -2479,6 +2499,7 @@ class StrangeloopAgent:
             "active_seed_ids": [seed.seed_id for seed in self.seed_store.list(self.session_id)
                                 if seed.status.value == "active"],
             "seed_auto_update": self.seed_auto_update_status(),
+            "memory_graph": self.memory_graph_status(),
             "event_count": len(self.event_store.list(self.session_id)),
             "loop": self.loop_status(),
             "provider": self.provider_status(),
