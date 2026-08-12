@@ -73,6 +73,22 @@ class ExpeditionSchedulerTests(unittest.TestCase):
         self.assertEqual(ExpeditionState.READY, scheduler.state)
         self.assertIsNotNone(scheduler.begin_slice(NOW + timedelta(seconds=1)))
 
+    def test_terminal_tasks_reclaim_a_bounded_candidate_slot(self):
+        """A working-set cap must not end an authorized episode early."""
+        scheduler = self.build(max_frontier_tasks=6, max_slices=8)
+        completed = set()
+        for number in range(6):
+            at = NOW + timedelta(seconds=number)
+            decision = scheduler.begin_slice(at)
+            completed.add(decision.task.task_id)
+            scheduler.record_outcome(decision.task.task_id, ExpeditionOutcome.BRANCH_COMPLETE, now=at)
+
+        next_decision = scheduler.begin_slice(NOW + timedelta(seconds=6))
+        self.assertIsNotNone(next_decision)
+        self.assertEqual(ExpeditionState.ACTIVE, scheduler.state)
+        self.assertNotIn(next_decision.task.task_id, completed)
+        self.assertEqual(6, len(scheduler._tasks))
+
     def test_empty_search_retries_with_fallback_then_drops_finitely(self):
         scheduler = self.build(max_empty_searches=2, max_task_attempts=4)
         first = scheduler.begin_slice(NOW)

@@ -598,6 +598,8 @@ class ExpeditionScheduler:
 
     def _add_task(self, persona: Persona, index: int) -> Optional[FrontierTask]:
         if len(self._tasks) >= self.config.max_frontier_tasks:
+            self._reclaim_terminal_task_slot()
+        if len(self._tasks) >= self.config.max_frontier_tasks:
             return None
         self._task_sequence += 1
         material = "%s:%s:%s:%s" % (self._seed_digest, persona.value, index, self._task_sequence)
@@ -620,6 +622,8 @@ class ExpeditionScheduler:
 
     def _add_experiment_task(self, index: int) -> Optional[FrontierTask]:
         if len(self._tasks) >= self.config.max_frontier_tasks:
+            self._reclaim_terminal_task_slot()
+        if len(self._tasks) >= self.config.max_frontier_tasks:
             return None
         kind = self.config.allowed_experiment_kinds[index % len(self.config.allowed_experiment_kinds)]
         persona = Persona(_PERSONA_ORDER[index % len(_PERSONA_ORDER)])
@@ -638,6 +642,26 @@ class ExpeditionScheduler:
             kind, _EXPERIMENT_ACTION_MODE)
         self._tasks[task.task_id] = task
         return task
+
+    def _reclaim_terminal_task_slot(self) -> bool:
+        """Release one completed scheduler cell while retaining its audit trail.
+
+        ``max_frontier_tasks`` bounds the mutable candidate working set, not
+        the total number of task instances an already-authorized episode may
+        attempt.  Outcomes remain in ``_history`` and in the external event
+        ledger before a terminal descriptor is released.  Active, pending,
+        and deferred tasks are never reclaimed, so this cannot cancel work or
+        bypass retries, authorization, quota, or slice limits.
+        """
+        terminal = [item for item in self._tasks.values()
+                    if item.status in (FrontierStatus.COMPLETE, FrontierStatus.DROPPED)]
+        if not terminal:
+            return False
+        # Stable ordering keeps replay deterministic without retaining an
+        # unbounded in-memory archive of already-recorded task descriptors.
+        retired = min(terminal, key=lambda item: item.task_id)
+        del self._tasks[retired.task_id]
+        return True
 
     def _select_task(self, persona: Persona) -> Tuple[Optional[FrontierTask], str]:
         baseline = self._eligible_for_persona(persona)
