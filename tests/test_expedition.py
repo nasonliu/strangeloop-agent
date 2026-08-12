@@ -66,6 +66,12 @@ class ExpeditionSchedulerTests(unittest.TestCase):
         self.assertEqual(left_public["authorization_seconds"], right_public["authorization_seconds"])
         self.assertEqual(left_public["max_slice_seconds"], right_public["max_slice_seconds"])
 
+    def test_frontier_working_set_supports_the_authorized_slice_bound(self):
+        self.assertEqual(1000, ExpeditionConfig().max_frontier_tasks)
+        self.assertEqual(1000, ExpeditionConfig(max_frontier_tasks=1000).max_frontier_tasks)
+        with self.assertRaises(ValueError):
+            ExpeditionConfig(max_frontier_tasks=1001)
+
     def test_branch_complete_does_not_end_expedition(self):
         scheduler = self.build()
         decision = scheduler.begin_slice(NOW)

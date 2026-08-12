@@ -179,7 +179,11 @@ class ExpeditionConfig:
     max_planner_failures: int = 3
     max_empty_searches: int = 2
     max_low_value_results: int = 3
-    max_frontier_tasks: int = 48
+    # This is a bounded in-memory candidate working set, not an execution
+    # allowance.  A full user-authorized expedition may schedule up to 360
+    # slices, so 48 could prematurely exhaust the descriptor pool while the
+    # stronger authorization, time, quota, and tool limits still allowed work.
+    max_frontier_tasks: int = 1000
     max_quota_retry_attempts: int = 3
     minimum_quality_score: float = 0.60
     # v3 is the only authorization format that can schedule host-only,
@@ -199,7 +203,7 @@ class ExpeditionConfig:
             (self.max_planner_failures, "max_planner_failures", 1, 12),
             (self.max_empty_searches, "max_empty_searches", 1, 12),
             (self.max_low_value_results, "max_low_value_results", 1, 12),
-            (self.max_frontier_tasks, "max_frontier_tasks", 6, 512),
+            (self.max_frontier_tasks, "max_frontier_tasks", 6, 1000),
             (self.max_quota_retry_attempts, "max_quota_retry_attempts", 1, 3),
         )
         for value, name, minimum, maximum in integer_bounds:
