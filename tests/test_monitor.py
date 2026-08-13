@@ -70,7 +70,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual([2, 3, 4, 5, 6], [item["sequence"] for item in events["events"]])
         with urlopen(self.url + "/", timeout=2) as response:
             page = response.read().decode("utf-8")
-        self.assertIn("Hidden chain-of-thought is neither stored nor shown.", page)
+        self.assertIn("这里显示的是能被账本回查的决策过程", page)
         self.assertIn("textContent", page)
         self.assertIn("自证／证自证镜映", page)
         self.assertIn("Quota sleep / wake", page)
@@ -243,10 +243,12 @@ class MonitorTests(unittest.TestCase):
 
     def test_dashboard_has_plain_language_work_cards_without_html_injection(self):
         page = dashboard_html()
-        for label in ("现在情况", "它正在做什么", "研究进展", "实验与学习",
-                      "资源与自动维护", "最近工作过程", "查看技术详情"):
+        for label in ("现在情况", "本轮要验证什么", "这一步为什么能做", "它正在做什么",
+                      "研究进展", "实验与学习", "资源与自动维护", "逐步决策记录",
+                      "查看技术详情"):
             self.assertIn(label, page)
-        self.assertIn("function plainEvent", page)
+        self.assertIn("function decisionEvent", page)
+        self.assertIn("function decisionBasis", page)
         self.assertIn("textContent", page)
         self.assertNotIn("innerHTML", page)
 
@@ -428,6 +430,18 @@ class MonitorTests(unittest.TestCase):
             self.assertNotIn("goal", json.dumps(state["expedition"]))
         finally:
             monitor.stop()
+
+    def test_expedition_public_goal_requires_explicit_visibility_marker(self):
+        projected = _state_projection({"expedition": {
+            "state": "active", "public_goal": "研究可检验的自我模型校准",
+            "goal_visibility": "user_public_research_goal_v1",
+        }}, [])
+        self.assertEqual("研究可检验的自我模型校准",
+                         projected["expedition"]["public_goal"])
+        hidden = _state_projection({"expedition": {
+            "state": "active", "public_goal": "planner output must not leak",
+        }}, [])
+        self.assertNotIn("public_goal", hidden["expedition"])
 
     def test_sleep_archive_v2_projects_only_recomputable_metadata(self):
         archive = event(11, "sleep_archive", {

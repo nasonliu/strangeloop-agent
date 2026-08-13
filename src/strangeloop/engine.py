@@ -920,6 +920,12 @@ class StrangeloopAgent:
         return {"state": raw["state"], "seed_digest": raw["seed_digest"],
                 "slice": raw["slice_number"], "authorization_seconds": raw["authorization_seconds"],
                 "max_slice_seconds": raw["max_slice_seconds"], "goal_digest": self._expedition_goal_digest,
+                # The expedition goal is an explicit user-supplied research
+                # contract.  It is intentionally distinct from model output
+                # and is safe for the localhost monitor only when accompanied
+                # by this fixed visibility marker.
+                "public_goal": self._expedition_goal,
+                "goal_visibility": "user_public_research_goal_v1",
                 "persona": self._expedition_current_persona,
                 # Completion coverage is scheduler-terminal bookkeeping, not
                 # a quality/progress claim about an experiment's findings.

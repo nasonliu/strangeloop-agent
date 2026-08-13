@@ -473,6 +473,14 @@ def _expedition_projection(raw: Any, events: List[Dict[str, Any]]) -> Dict[str, 
     candidate = candidate if isinstance(candidate, dict) else {}
     state: Dict[str, Any] = {}
 
+    # The only prose goal accepted here is the explicit USER research contract
+    # produced by ``StrangeloopAgent.expedition_status``.  Planner text,
+    # candidate descriptions, queries, and model output remain excluded.
+    if candidate.get("goal_visibility") == "user_public_research_goal_v1":
+        goal = candidate.get("public_goal")
+        if isinstance(goal, str) and 1 <= len(goal) <= 4000:
+            state["public_goal"] = _safe_text(goal)
+
     value = candidate.get("state")
     if value in _EXPEDITION_STATES:
         state["state"] = value
