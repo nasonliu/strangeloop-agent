@@ -474,11 +474,13 @@ def _handle_monitor_command(monitor: Optional[CognitiveMonitor], agent: Strangel
         if monitor is None:
             monitor = CognitiveMonitor(event_store=agent.event_store, agent=agent,
                                        session_id=agent.session_id)
+        agent.set_expedition_yield_requested(monitor.has_pending_chat)
         print("Monitor: " + monitor.start_background())
         return monitor
     if action == "stop":
         if monitor is not None:
             monitor.stop()
+        agent.set_expedition_yield_requested(None)
         print("Monitor stopped.")
         return monitor
     print("Usage: /monitor [status|start|stop]")
