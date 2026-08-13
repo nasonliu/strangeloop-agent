@@ -76,7 +76,7 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("Quota sleep / wake", page)
         self.assertIn("Unattended research", page)
         self.assertIn("Expedition", page)
-        self.assertIn("textContent=JSON.stringify(state.expedition||{},null,2)", page)
+        self.assertIn("byId('expedition').textContent=JSON.stringify(e,null,2)", page)
         self.assertNotIn("innerHTML", page)
 
     def test_dashboard_script_is_syntactically_valid(self):
@@ -239,7 +239,16 @@ class MonitorTests(unittest.TestCase):
     def test_dashboard_labels_primary_window_through_text_content(self):
         page = dashboard_html()
         self.assertIn("primary window:", page)
-        self.assertIn("byId('quota').textContent=quotaLine(state.quota||{})", page)
+        self.assertIn("byId('quota').textContent=quotaLine(q)", page)
+
+    def test_dashboard_has_plain_language_work_cards_without_html_injection(self):
+        page = dashboard_html()
+        for label in ("现在情况", "它正在做什么", "研究进展", "实验与学习",
+                      "资源与自动维护", "最近工作过程", "查看技术详情"):
+            self.assertIn(label, page)
+        self.assertIn("function plainEvent", page)
+        self.assertIn("textContent", page)
+        self.assertNotIn("innerHTML", page)
 
     def test_unattended_report_unknown_values_fail_closed(self):
         state = _state_projection({"unattended_research": {
