@@ -403,8 +403,12 @@ class ExpeditionScheduler:
             raise ValueError("quota retry_at must be in the future")
         if self._active_task_id is not None:
             raise RuntimeError("cannot defer quota retry during an active slice")
-        # Cadence waiting is ordinary timing, not a provider/bridge failure.
-        if reason not in ("quota_refresh_interval_waiting", "quota_reset_requires_fresh_telemetry"):
+        # Cadence waiting and explicitly classified transient bridge failures
+        # are not a terminal resource condition.  They remain fail-closed for
+        # work, but a foreground owner may keep retrying at its bounded gate
+        # cadence until fresh provider evidence arrives or authorization ends.
+        if reason not in ("quota_refresh_interval_waiting", "quota_reset_requires_fresh_telemetry",
+                          "quota_refresh_transient_retry_pending"):
             self._quota_retry_attempts += 1
         self._quota_retry_at, self._quota_retry_reason = retry, reason
         if self._quota_retry_attempts > self.config.max_quota_retry_attempts:

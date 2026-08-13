@@ -105,6 +105,22 @@ class _UnknownQuotaAdapter:
                                        observed, None, "unknown_provider_plan_cost", None)
 
 
+class _RepeatedTransientQuotaAdapter:
+    """A redacted bridge outage: retrying must never authorize research."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def refresh_foreground_slice(self, quota, gate, observed, force=False):
+        del quota, gate, force
+        self.calls += 1
+        retry_at = observed + timedelta(seconds=5)
+        return ForegroundRefreshStatus(
+            True, False, False, False, "quota_refresh_unknown_fail_closed",
+            "bridge_timeout", observed, retry_at, "unknown_provider_plan_cost", None,
+            next_retry_at=retry_at)
+
+
 class _PermanentAuthQuotaAdapter:
     def refresh_foreground_slice(self, quota, gate, observed, force=False):
         del quota, gate, force
@@ -345,7 +361,7 @@ class ExpeditionRedTeamTests(unittest.TestCase):
                                        authorization.event_id)
                 pending = agent.expedition_slice(adapter)
                 self.assertEqual("waiting_quota_retry", pending["state"])
-                self.assertEqual(1, pending["quota_retry"]["attempts"])
+                self.assertEqual(0, pending["quota_retry"]["attempts"])
                 self.assertEqual(retry_at.isoformat(), pending["quota_retry"]["retry_at"])
                 self.assertEqual("quota_refresh_transient_retry_pending",
                                  pending["quota_retry"]["reason"])
@@ -368,6 +384,36 @@ class ExpeditionRedTeamTests(unittest.TestCase):
             self.assertNotEqual("waiting_quota_retry", resumed["state"])
             self.assertEqual(2, adapter.calls)
             self.assertEqual(1, len(k3_calls))
+        finally:
+            agent.event_store.close()
+
+    def test_repeated_transient_refreshes_keep_waiting_until_fresh_evidence(self):
+        """A temporary provider outage never spends the scheduler into STOPPED."""
+        coordinator = SleepWakeCoordinator()
+        agent, tools = _agent("expedition-transient-continuity", coordinator)
+        try:
+            authorization = _expedition_approval(agent)
+            issued = datetime.fromisoformat(authorization.payload["issued_at"])
+            clock = {"now": max(issued + timedelta(seconds=1),
+                                  datetime.now(timezone.utc) + timedelta(seconds=1))}
+            adapter = _RepeatedTransientQuotaAdapter()
+            k3_calls = []
+            agent.runtime.plan_tools = lambda prompt, context: k3_calls.append((prompt, context)) or ()
+            with patch.object(agent, "_sleep_now", side_effect=lambda: clock["now"]):
+                agent.start_expedition("public source comparison", "host-seed", 60, 30, 2,
+                                       authorization.event_id)
+                for _ in range(5):
+                    status = agent.expedition_slice(adapter)
+                    self.assertEqual("waiting_quota_retry", status["state"])
+                    self.assertEqual("quota_refresh_transient_retry_pending",
+                                     status["quota_retry"]["reason"])
+                    self.assertEqual(0, status["quota_retry"]["attempts"])
+                    clock["now"] = datetime.fromisoformat(status["quota_retry"]["retry_at"])
+            self.assertEqual(5, adapter.calls)
+            self.assertEqual(SleepState.ACTIVE, coordinator.state)
+            self.assertEqual([], k3_calls)
+            self.assertEqual([], [event for event in agent.event_store.list(agent.session_id)
+                                  if event.kind == EventKind.CAPABILITY_GRANTED])
         finally:
             agent.event_store.close()
 

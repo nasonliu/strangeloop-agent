@@ -1413,10 +1413,21 @@ class StrangeloopAgent:
         if not (refresh.attempted and refresh.accepted):
             interval_wait = refresh.reason == "quota_refresh_interval_waiting"
             reset_wait = refresh.reason == "quota_reset_requires_fresh_telemetry"
+            transient_errors = {
+                "bridge_start_failed", "bridge_start_timeout", "bridge_timeout",
+                "bridge_network_error", "bridge_http_error", "provider_rate_limited",
+            }
+            # A gate's own interval/retry response and a specifically redacted
+            # transient bridge error both mean "wait, then ask the provider
+            # again".  They cannot authorize work, but must not turn a
+            # temporary telemetry outage into a permanent expedition stop.
+            transient_wait = (not refresh.attempted
+                              or getattr(refresh, "error_category", None) in transient_errors)
             now = self._sleep_now()
             waiting_reason = ("quota_refresh_interval_waiting" if interval_wait else
                               "quota_reset_requires_fresh_telemetry" if reset_wait else
-                              "quota_refresh_transient_retry_pending")
+                              "quota_refresh_transient_retry_pending" if transient_wait else
+                              "quota_refresh_unknown_fail_closed")
             self._expedition.defer_quota_retry(waiting_reason,
                                                self._expedition_retry_at(refresh, now), now)
             return self.expedition_status()
