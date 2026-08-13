@@ -82,16 +82,38 @@ def run_repl(agent: StrangeloopAgent, inputs: Optional[Iterable[str]] = None,
     print(BANNER)
     iterator = iter(inputs) if inputs is not None else None
     while True:
+        if monitor is not None:
+            pending_chat = monitor.take_chat_message()
+            if pending_chat is not None:
+                _process_monitor_chat(agent, monitor, pending_chat)
+                continue
         try:
             if iterator is not None:
                 line = next(iterator)
+            elif monitor is not None:
+                # Keep the owning CLI thread responsive to local monitor chat
+                # without allowing the HTTP server thread to touch the agent
+                # or its SQLite connection.
+                try:
+                    readable, _, _ = select.select([sys.stdin], [], [], 0.5)
+                except (OSError, ValueError):
+                    readable = [sys.stdin]
+                if not readable:
+                    if agent.expedition_status().get("state") == "waiting_quota_retry":
+                        _run_expedition_foreground(agent, getattr(agent, "usage_adapter", None), monitor)
+                    elif _sleep_wait_due(agent):
+                        adapter = getattr(agent, "usage_adapter", None)
+                        if adapter is not None and agent.poll_sleep(adapter):
+                            _resume_expedition_after_wake(agent, adapter)
+                    continue
+                line = input("> ")
             elif agent.expedition_status().get("state") == "waiting_quota_retry":
                 try:
                     readable, _, _ = select.select([sys.stdin], [], [], 1.0)
                 except (OSError, ValueError):
                     readable = [sys.stdin]
                 if not readable:
-                    _run_expedition_foreground(agent, getattr(agent, "usage_adapter", None))
+                    _run_expedition_foreground(agent, getattr(agent, "usage_adapter", None), monitor)
                     continue
                 line = input("> ")
             elif _sleep_wait_due(agent):
@@ -175,7 +197,7 @@ def run_repl(agent: StrangeloopAgent, inputs: Optional[Iterable[str]] = None,
                 print("Expedition refused: " + str(error))
         elif command == "/expedition run":
             try:
-                _run_expedition_foreground(agent, getattr(agent, "usage_adapter", None))
+                _run_expedition_foreground(agent, getattr(agent, "usage_adapter", None), monitor)
             except (RuntimeError, ValueError, PermissionError) as error:
                 print("Expedition refused: " + str(error))
         elif command == "/expedition stop":
@@ -324,6 +346,19 @@ def run_repl(agent: StrangeloopAgent, inputs: Optional[Iterable[str]] = None,
             print(result.response_text)
             for notice in result.notices:
                 print("Notice: " + notice)
+
+
+def _process_monitor_chat(agent: StrangeloopAgent, monitor: CognitiveMonitor,
+                          item: dict) -> None:
+    """Execute one same-origin monitor message on the CLI owner thread."""
+    try:
+        result = agent.run_turn(item["message"], channel="monitor_chat")
+        monitor.complete_chat_message(item["message_id"], result.response_text, result.notices)
+        print("[monitor chat] " + result.response_text)
+    except (RuntimeError, ValueError, PermissionError):
+        # The local UI gets a fixed public failure rather than an exception
+        # string that might contain model, path, or provider details.
+        monitor.fail_chat_message(item["message_id"])
 
 
 def _ingest_cli_media(agent: StrangeloopAgent, media_file, path: str):
@@ -553,11 +588,17 @@ def _resume_expedition_after_wake(agent: StrangeloopAgent, adapter: object) -> N
     _run_expedition_foreground(agent, adapter)
 
 
-def _run_expedition_foreground(agent: StrangeloopAgent, adapter: object) -> None:
+def _run_expedition_foreground(agent: StrangeloopAgent, adapter: object,
+                               monitor: Optional[CognitiveMonitor] = None) -> None:
     """Single caller-thread runner used for initial, REPL, and wake paths."""
+    def on_slice(status: dict) -> None:
+        print(json.dumps(status, ensure_ascii=False, sort_keys=True))
+        if monitor is not None:
+            pending = monitor.take_chat_message()
+            if pending is not None:
+                _process_monitor_chat(agent, monitor, pending)
     try:
-        agent.run_expedition_foreground(
-            adapter, on_slice=lambda status: print(json.dumps(status, ensure_ascii=False, sort_keys=True)))
+        agent.run_expedition_foreground(adapter, on_slice=on_slice)
     except KeyboardInterrupt:
         _user_command_event(agent, "User interrupted the foreground expedition.")
         print(json.dumps(agent.stop_expedition("user_stop"), ensure_ascii=False, sort_keys=True))
@@ -916,7 +957,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             print("Monitor: " + monitor.start_background(port=args.monitor_port))
         if expedition_ready:
             try:
-                _run_expedition_foreground(agent, agent.usage_adapter)
+                _run_expedition_foreground(agent, agent.usage_adapter, monitor)
             except (RuntimeError, ValueError, PermissionError) as error:
                 print("Expedition refused: " + str(error))
         if args.unattended:

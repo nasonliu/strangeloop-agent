@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 from .monitor_ui import dashboard_html
 
@@ -741,6 +742,73 @@ class CognitiveMonitor:
         self._session_id = session_id or getattr(agent, "session_id", None) or getattr(self._store, "session_id", None)
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+        # HTTP handlers never call the agent.  They only place explicit user
+        # messages in this small in-process mailbox; the CLI foreground thread
+        # later consumes them through the ordinary user-turn path.
+        self._chat_lock = threading.RLock()
+        self._chat_items: List[Dict[str, Any]] = []
+
+    def submit_chat_message(self, message: Any) -> Dict[str, str]:
+        """Queue one bounded local user message without executing the agent."""
+        if not isinstance(message, str):
+            raise ValueError("message must be text")
+        message = message.strip()
+        if not message or len(message) > 2000 or "\x00" in message:
+            raise ValueError("message must contain 1-2000 non-NUL characters")
+        item = {"message_id": "chat_%s" % uuid4().hex, "message": message,
+                "submitted_at": datetime.now(timezone.utc).isoformat(), "status": "queued"}
+        with self._chat_lock:
+            self._chat_items.append(item)
+            del self._chat_items[:-40]
+        return {"message_id": item["message_id"], "status": "queued"}
+
+    def take_chat_message(self) -> Optional[Dict[str, str]]:
+        """Claim at most one queued message for the CLI foreground thread."""
+        with self._chat_lock:
+            for item in self._chat_items:
+                if item.get("status") == "queued":
+                    item["status"] = "processing"
+                    return {"message_id": item["message_id"], "message": item["message"]}
+        return None
+
+    def complete_chat_message(self, message_id: str, response: Any,
+                              notices: Iterable[Any] = ()) -> None:
+        """Publish a bounded ordinary-turn response after CLI processing."""
+        safe_response = _safe_text(response)
+        if safe_response is None:
+            safe_response = "[no public response]"
+        safe_notices = [value for value in (_safe_text(item) for item in notices)
+                        if value is not None][:5]
+        with self._chat_lock:
+            for item in self._chat_items:
+                if item.get("message_id") == message_id and item.get("status") == "processing":
+                    item.update({"status": "completed", "response": safe_response,
+                                 "notices": safe_notices,
+                                 "completed_at": datetime.now(timezone.utc).isoformat()})
+                    return
+
+    def fail_chat_message(self, message_id: str) -> None:
+        with self._chat_lock:
+            for item in self._chat_items:
+                if item.get("message_id") == message_id and item.get("status") == "processing":
+                    item.update({"status": "failed", "response": "本次对话没有完成；没有执行工具。",
+                                 "completed_at": datetime.now(timezone.utc).isoformat()})
+                    return
+
+    def chat_history(self) -> List[Dict[str, Any]]:
+        """Return the local chat transcript with text safety filtering."""
+        with self._chat_lock:
+            history = []
+            for item in self._chat_items[-20:]:
+                record = {"message_id": item["message_id"], "status": item["status"],
+                          "submitted_at": item["submitted_at"],
+                          "message": _safe_text(item["message"]) or "[redacted]"}
+                if isinstance(item.get("response"), str):
+                    record["response"] = item["response"]
+                if isinstance(item.get("notices"), list):
+                    record["notices"] = list(item["notices"])
+                history.append(record)
+            return history
 
     def _events(self) -> List[Any]:
         if self._event_source is not None:
@@ -975,4 +1043,32 @@ class _Handler(BaseHTTPRequestHandler):
             try: after = max(0, int(raw))
             except (TypeError, ValueError): self._send(400, {"error": "after_sequence must be a non-negative integer"}); return
             self._send(200, {"events": self.source.events(after), "after_sequence": after}); return
+        if parsed.path == "/api/chat":
+            self._send(200, {"messages": self.source.chat_history()}); return
         self._send(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/chat":
+            self._send(404, {"error": "not found"}); return
+        # The chat surface is intentionally same-origin and localhost-only.
+        # This prevents a random browser page from using the user's local
+        # monitor as a cross-site message injector.
+        if self.headers.get("Origin") != self.source.url:
+            self._send(403, {"error": "local same-origin request required"}); return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send(400, {"error": "invalid content length"}); return
+        if not 1 <= length <= 4096 or self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
+            self._send(400, {"error": "bounded JSON message required"}); return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send(400, {"error": "invalid JSON"}); return
+        if not isinstance(body, dict) or set(body) != {"message"}:
+            self._send(400, {"error": "exactly one message field is required"}); return
+        try:
+            self._send(202, self.source.submit_chat_message(body["message"]))
+        except ValueError as error:
+            self._send(400, {"error": str(error)})

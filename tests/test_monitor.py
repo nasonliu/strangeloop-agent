@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from strangeloop.monitor import CognitiveMonitor, _state_projection, project_event
 from strangeloop.monitor_ui import dashboard_html
@@ -92,6 +92,28 @@ class MonitorTests(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
             )
             self.assertEqual(0, checked.returncode, checked.stderr)
+
+    def test_chat_endpoint_only_queues_same_origin_messages(self):
+        request = Request(self.url + "/api/chat", method="POST",
+                          data=json.dumps({"message": "请说明当前研究进度"}).encode("utf-8"),
+                          headers={"Content-Type": "application/json", "Origin": self.url})
+        with urlopen(request, timeout=2) as response:
+            self.assertEqual(202, response.status)
+            receipt = json.loads(response.read().decode("utf-8"))
+        item = self.monitor.take_chat_message()
+        self.assertEqual(receipt["message_id"], item["message_id"])
+        self.assertEqual("请说明当前研究进度", item["message"])
+        self.monitor.complete_chat_message(item["message_id"], "当前在检索公开资料。")
+        status, transcript = self.get_json("/api/chat")
+        self.assertEqual(200, status)
+        self.assertEqual("completed", transcript["messages"][0]["status"])
+        self.assertEqual("当前在检索公开资料。", transcript["messages"][0]["response"])
+        foreign = Request(self.url + "/api/chat", method="POST",
+                          data=json.dumps({"message": "wrong origin"}).encode("utf-8"),
+                          headers={"Content-Type": "application/json", "Origin": "https://example.invalid"})
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(foreign, timeout=2)
+        self.assertEqual(403, raised.exception.code)
 
     def test_sleep_wake_projection_is_metadata_only_and_never_claims_reset_wakes(self):
         _, state = self.get_json("/api/state")

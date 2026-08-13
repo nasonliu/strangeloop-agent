@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from strangeloop.cli import (BANNER, _resume_expedition_after_wake,
+from strangeloop.cli import (BANNER, _process_monitor_chat, _resume_expedition_after_wake,
                              _sleep_poll_timeout, _sleep_wait_due, build_parser,
                              main, run_repl)
 from strangeloop.contracts import CognitiveEvent, EventKind, SourceKind
@@ -24,9 +24,24 @@ from strangeloop.tool_session import ToolSession
 from strangeloop.drives import DualIntrinsicDrives
 from strangeloop.sleep import SleepWakeCoordinator, SleepWakePolicy
 from strangeloop.kimi_cli import KimiCliUsageResult, ManagedUsageWindow
+from strangeloop.monitor import CognitiveMonitor
 
 
 class CliTests(unittest.TestCase):
+    def test_monitor_chat_runs_only_on_the_owner_thread_as_a_user_turn(self):
+        agent = StrangeloopAgent(session_id="monitor-chat-cli")
+        monitor = CognitiveMonitor(event_store=agent.event_store, session_id=agent.session_id)
+        receipt = monitor.submit_chat_message("请用普通语言介绍当前状态")
+        item = monitor.take_chat_message()
+        self.assertEqual(receipt["message_id"], item["message_id"])
+        _process_monitor_chat(agent, monitor, item)
+        transcript = monitor.chat_history()
+        self.assertEqual("completed", transcript[0]["status"])
+        self.assertTrue(transcript[0]["response"])
+        observations = [event for event in agent.event_store.list(agent.session_id)
+                        if event.kind == EventKind.OBSERVATION]
+        self.assertEqual("monitor_chat", observations[-1].payload["channel"])
+
     def test_seed_auto_flag_is_explicit_and_bounded(self):
         args = build_parser().parse_args(["--seed-auto-update"])
         self.assertTrue(args.seed_auto_update)

@@ -1878,13 +1878,16 @@ class StrangeloopAgent:
         return {"target_event_id": target.event_id, "feedback": feedback,
                 "reward": reward.to_payload(), "channel_updates": [item.to_payload() for item in records]}
 
-    def run_turn(self, user_text: str, authorized: bool = False) -> TurnResult:
+    def run_turn(self, user_text: str, authorized: bool = False,
+                 channel: str = "text") -> TurnResult:
         """Process one user observation and execute only a safe response action."""
+        if channel not in ("text", "monitor_chat"):
+            raise ValueError("user turn channel is not allowed")
         self._maybe_enter_sleep()
         observation = self.event_store.append(CognitiveEvent(
             session_id=self.session_id, kind=EventKind.OBSERVATION,
             source_kind=SourceKind.USER, source_ref="user",
-            payload={"content": user_text, "channel": "text"},
+            payload={"content": user_text, "channel": channel},
         ))
         active_seeds = self.seed_store.retrieve(
             self.session_id, self._seed_cue_terms(user_text), scope="conversation"
