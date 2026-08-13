@@ -954,6 +954,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             agent.update_managed_usage(initial_usage)
         if args.monitor:
             monitor = CognitiveMonitor(event_store=store, agent=agent, session_id=args.session)
+            # This is only a cooperative interactive yield signal.  The
+            # monitor request thread still cannot call into the agent.
+            agent.set_expedition_yield_requested(monitor.has_pending_chat)
             print("Monitor: " + monitor.start_background(port=args.monitor_port))
         if expedition_ready:
             try:

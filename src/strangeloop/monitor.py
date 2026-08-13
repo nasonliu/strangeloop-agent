@@ -771,6 +771,11 @@ class CognitiveMonitor:
                     return {"message_id": item["message_id"], "message": item["message"]}
         return None
 
+    def has_pending_chat(self) -> bool:
+        """A lock-protected, side-effect-free yield signal for the owner loop."""
+        with self._chat_lock:
+            return any(item.get("status") == "queued" for item in self._chat_items)
+
     def complete_chat_message(self, message_id: str, response: Any,
                               notices: Iterable[Any] = ()) -> None:
         """Publish a bounded ordinary-turn response after CLI processing."""

@@ -845,6 +845,7 @@ class StrangeloopAgent:
         self._expedition_duplicate_experiment_result_count = 0
         self._expedition_last_strategy_arm_id = None
         self._expedition_last_strategy_arm_version = None
+        self._expedition_yield_requested = None
         guidance = self._expedition_seed_guidance()
         self._expedition_seed_context_event_id = self._record_expedition_seed_context(
             run_id, consumption.event_id, guidance).event_id
@@ -1534,7 +1535,8 @@ class StrangeloopAgent:
         try:
             self._start_unattended_research(profile, policy, self._expedition_approval_event_id,
                                             model_trigger_event_id=self._expedition_model_trigger_event_id)
-            outcome = self.run_unattended_research()
+            outcome = self.run_unattended_research(
+                yield_requested=self._expedition_yield_requested)
             report = outcome["public_report"]
             actions = report.get("actions", ())
             if not actions:
@@ -1642,13 +1644,42 @@ class StrangeloopAgent:
         return {"receipt": self._unattended_receipt(receipt), "status": self.unattended_status(),
                 "public_report": self.unattended_public_report()}
 
-    def run_unattended_research(self) -> Dict[str, Any]:
+    def run_unattended_research(self, yield_requested: Any = None) -> Dict[str, Any]:
         if self._unattended is None:
             raise RuntimeError("unattended research is not active; start it with an explicit user policy")
         self._maybe_enter_sleep()
-        receipts = self._unattended.run()
+        receipts = []
+        while self._unattended.state.value == "running":
+            receipt = self._unattended.step()
+            receipts.append(receipt)
+            # The host may yield only between completed read-only ticks.  The
+            # callback has no ability to alter grants, quota, or the action
+            # already in flight; it merely lets a queued direct user message
+            # take priority before another planner/tool round begins.
+            try:
+                if callable(yield_requested) and bool(yield_requested()):
+                    break
+            except Exception:
+                # A UI/yield failure must never become authority over the
+                # research controller.  Continue its normal bounded run.
+                pass
+            if (receipt.state_before == receipt.state_after
+                    and receipt.state_after.value == "running"
+                    and receipt.action is None):
+                break
         return {"receipts": [self._unattended_receipt(item) for item in receipts],
                 "status": self.unattended_status(), "public_report": self.unattended_public_report()}
+
+    def set_expedition_yield_requested(self, callback: Any) -> None:
+        """Install a transient host-side yield check for an interactive UI.
+
+        The callback is never persisted and is queried only between completed
+        controlled read-only actions.  It cannot authorize tools or modify an
+        expedition decision.
+        """
+        if callback is not None and not callable(callback):
+            raise TypeError("expedition yield callback must be callable or None")
+        self._expedition_yield_requested = callback
 
     def unattended_public_report(self) -> Dict[str, Any]:
         """Deterministic report from existing bounded tool outcomes only.

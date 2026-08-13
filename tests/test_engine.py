@@ -209,6 +209,37 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(2, state["finding_count"])
         self.assertNotIn("public summary", repr(state))
 
+    def test_unattended_run_yields_only_after_a_completed_read_only_tick(self):
+        runtime = k3_runtime(FakeK3Transport())
+        intents = [ToolIntent("intent_1", "web_search", {"query": "public docs"}, "Search public docs."),
+                   ToolIntent("intent_2", "respond", {"message": "complete"}, "Research complete.")]
+        runtime.plan_tools = lambda prompt, public_context: (intents.pop(0),)
+
+        class StaticPublicBackend:
+            def __init__(self): self.calls = 0
+            def execute(self, plan, registry):
+                self.calls += 1
+                registry.consume(plan)
+                return ToolOutcome.from_bytes(plan.tool_name, ToolStatus.SUCCEEDED, b"public summary")
+
+        store, registry, fetch = SQLiteEventStore(), CapabilityRegistry(), PublicWebFetch(())
+        public = StaticPublicBackend()
+        session = ToolSession("research-yield", "workspace", registry, ControlledToolExecutor(os.getcwd()),
+                              event_store=store, web_fetch=fetch, web_search=public, browser_read=public)
+        agent = StrangeloopAgent(session_id="research-yield", event_store=store,
+                                 runtime=runtime, tool_session=session)
+        approval = store.append(CognitiveEvent(session_id="research-yield", kind=EventKind.OBSERVATION,
+            source_kind=SourceKind.USER, source_ref="user", payload={"content": "research", "channel": "cli_command"}))
+        policy = UnattendedPolicy.user_issued("inspect public documentation",
+            datetime.now(timezone.utc) + timedelta(minutes=1))
+        agent.start_unattended_research(ResearchAutonomyProfile("workspace", ResearchBudget(
+            max_tool_calls=3, max_total_bytes=65536, max_response_bytes=4096,
+            max_wall_ms=10000, ttl_seconds=60)), policy, approval.event_id)
+        outcome = agent.run_unattended_research(yield_requested=lambda: True)
+        self.assertEqual(1, public.calls)
+        self.assertEqual(1, len(outcome["receipts"]))
+        self.assertEqual("running", outcome["status"]["state"])
+
     def test_unattended_quota_exhaustion_during_k3_planning_cannot_reach_tool_execution(self):
         now = datetime.now(timezone.utc)
         controller = QuotaController()
